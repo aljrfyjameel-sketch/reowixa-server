@@ -1,2 +1,3 @@
-websockets
-google-genai
+
+websockets>=14,<16
+google-genai>=1.0.0
