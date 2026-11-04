@@ -26,6 +26,8 @@ client = genai.Client(api_key=API_KEY) if API_KEY else None
 
 CHAT_MODEL = os.getenv("GEMINI_CHAT_MODEL", "gemini-3.5-flash-lite")
 TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-3.8-flash-lite-tts")
+if TTS_MODEL == "gemini-3.1-flash-tts-preview":
+    TTS_MODEL = "gemini-3.8-flash-lite-tts"  # Migrate legacy Render env settings automatically.
 TTS_VOICE = os.getenv("GEMINI_TTS_VOICE", "Kore")
 MAX_PCM_BYTES = 320_000  # ten seconds, 16 kHz, mono PCM16
 
