@@ -26,6 +26,7 @@ client = genai.Client(api_key=API_KEY) if API_KEY else None
 
 CHAT_MODEL = os.getenv("GEMINI_CHAT_MODEL", "gemini-3.5-flash-lite")
 TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-3.8-flash-lite-tts")
+LIVE_MODEL = os.getenv("GEMINI_LIVE_MODEL", "gemini-3.8-live")
 if TTS_MODEL == "gemini-3.1-flash-tts-preview":
     TTS_MODEL = "gemini-3.8-flash-lite-tts"  # Migrate legacy Render env settings automatically.
 TTS_VOICE = os.getenv("GEMINI_TTS_VOICE", "Kore")
@@ -284,6 +285,118 @@ async def speak_message(
 
 
 # ==========================================
+# Low-latency audio-to-audio response
+# ==========================================
+
+async def answer_with_live_audio(websocket: WebSocket, wav_bytes: bytes) -> bool:
+    """Stream a recorded visitor question through Gemini Live and relay its audio.
+
+    Returns False only when Live fails before sending any audio, so the caller can
+    fall back to the existing transcription + TTS path.
+    """
+    if not client:
+        return False
+
+    with wave.open(io.BytesIO(wav_bytes), "rb") as wav:
+        if wav.getnchannels() != 1 or wav.getsampwidth() != 2:
+            raise ValueError("Live input must be mono PCM16 WAV")
+        sample_rate = wav.getframerate()
+        pcm = wav.readframes(wav.getnframes())
+
+    if sample_rate not in (16000, 24000) or not pcm:
+        raise ValueError("Unsupported or empty Live audio input")
+
+    system_instruction = (
+        SYSTEM_PROMPT
+        + "\n\nأجب بلغة الزائر مباشرة وبإجابة صوتية قصيرة لا تتجاوز جملتين."
+    )
+    config = types.LiveConnectConfig(
+        response_modalities=["AUDIO"],
+        system_instruction=system_instruction,
+        speech_config=types.SpeechConfig(
+            voice_config=types.VoiceConfig(
+                prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                    voice_name=TTS_VOICE
+                )
+            )
+        ),
+        output_audio_transcription=types.AudioTranscriptionConfig(),
+    )
+
+    audio_started = False
+    transcript_parts = []
+    try:
+        async with client.aio.live.connect(model=LIVE_MODEL, config=config) as session:
+            chunk_size = 4096
+            mime_type = f"audio/pcm;rate={sample_rate}"
+            for offset in range(0, len(pcm), chunk_size):
+                await session.send_realtime_input(
+                    audio=types.Blob(
+                        data=pcm[offset:offset + chunk_size],
+                        mime_type=mime_type,
+                    )
+                )
+            await session.send_realtime_input(audio_stream_end=True)
+
+            async for response in session.receive():
+                content = response.server_content
+                if content is None:
+                    continue
+
+                transcription = content.output_transcription
+                if transcription and transcription.text:
+                    transcript_parts.append(transcription.text)
+
+                turn = content.model_turn
+                if turn:
+                    for part in turn.parts or []:
+                        inline = part.inline_data
+                        if not inline or not inline.data:
+                            continue
+
+                        audio = inline.data
+                        if isinstance(audio, str):
+                            audio = audio.encode("latin-1")
+                        audio = audio[:len(audio) & ~1]
+                        if not audio:
+                            continue
+
+                        if not audio_started:
+                            await websocket.send_json({
+                                "type": "audio_start",
+                                "format": "pcm_s16le",
+                                "sample_rate": 24000,
+                                "channels": 1,
+                                "bits": 16,
+                            })
+                            audio_started = True
+                        await websocket.send_bytes(audio)
+
+                if content.turn_complete:
+                    break
+
+        if not audio_started:
+            return False
+
+        answer = "".join(transcript_parts).strip()
+        if answer:
+            await websocket.send_json({"type": "response", "message": answer})
+            await websocket.send_json({"type": "transcript_answer", "text": answer})
+        await websocket.send_json({"type": "audio_end"})
+        return True
+
+    except Exception:
+        logger.exception("Gemini Live audio response failed")
+        if audio_started:
+            try:
+                await websocket.send_json({"type": "audio_end"})
+            except Exception:
+                pass
+            raise
+        return False
+
+
+# ==========================================
 # Process visitor question
 # ==========================================
 
@@ -299,6 +412,9 @@ async def process_question(
         })
 
         if audio_bytes is not None:
+            if await answer_with_live_audio(websocket, audio_bytes):
+                return
+            logger.warning("Falling back to standard audio question path")
             answer = await asyncio.to_thread(
                 understand_audio,
                 audio_bytes
