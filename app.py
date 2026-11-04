@@ -272,16 +272,12 @@ async def speak_message(
         "message": "RIWEXA تتحدث..."
     })
 
-    pcm, rate = await asyncio.to_thread(
-        make_speech,
-        message
-    )
+    live_prompt = f"انطق النص التالي كما هو وبصوت ودود، دون إضافة شرح: {message}"
+    if await answer_with_live(websocket, question=live_prompt):
+        return
 
-    await send_audio_stream(
-        websocket,
-        pcm,
-        rate
-    )
+    pcm, rate = await asyncio.to_thread(make_speech, message)
+    await send_audio_stream(websocket, pcm, rate)
 
 
 # ==========================================
@@ -325,6 +321,11 @@ async def answer_with_live(websocket: WebSocket, wav_bytes: bytes = None, questi
             )
         ),
         output_audio_transcription=types.AudioTranscriptionConfig(),
+        realtime_input_config=types.RealtimeInputConfig(
+            automatic_activity_detection=types.AutomaticActivityDetection(
+                disabled=True
+            )
+        ),
     )
 
     audio_started = False
@@ -334,6 +335,7 @@ async def answer_with_live(websocket: WebSocket, wav_bytes: bytes = None, questi
             if pcm:
                 chunk_size = 4096
                 mime_type = f"audio/pcm;rate={sample_rate}"
+                await session.send_realtime_input(activity_start=types.ActivityStart())
                 for offset in range(0, len(pcm), chunk_size):
                     await session.send_realtime_input(
                         audio=types.Blob(
@@ -341,7 +343,7 @@ async def answer_with_live(websocket: WebSocket, wav_bytes: bytes = None, questi
                             mime_type=mime_type,
                         )
                     )
-                await session.send_realtime_input(audio_stream_end=True)
+                await session.send_realtime_input(activity_end=types.ActivityEnd())
             else:
                 await session.send_client_content(
                     turns=types.Content(
