@@ -397,8 +397,18 @@ async def answer_with_live(websocket: WebSocket, wav_bytes: bytes = None, questi
         await websocket.send_json({"type": "audio_end"})
         return True
 
-    except Exception:
-        logger.exception("Gemini Live audio response failed")
+    except Exception as exc:
+        provider_status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+        logger.exception("Gemini Live audio response failed (%s, %s)", type(exc).__name__, provider_status)
+        try:
+            await websocket.send_json({
+                "type": "diagnostic",
+                "source": "live",
+                "error_type": type(exc).__name__,
+                "status": provider_status,
+            })
+        except Exception:
+            pass
         if audio_started:
             try:
                 await websocket.send_json({"type": "audio_end"})
@@ -451,12 +461,14 @@ async def process_question(
             rate
         )
 
-    except Exception:
-        logger.exception("Question processing failed")
+    except Exception as exc:
+        provider_status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+        logger.exception("Question processing failed (%s, %s)", type(exc).__name__, provider_status)
 
         await websocket.send_json({
             "type": "error",
-            "message": "تعذر معالجة السؤال. حاول مرة أخرى."
+            "message": "تعذر معالجة السؤال. حاول مرة أخرى.",
+            "diagnostic": {"error_type": type(exc).__name__, "status": provider_status},
         })
 
 
