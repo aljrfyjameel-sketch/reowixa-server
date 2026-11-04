@@ -310,23 +310,23 @@ async def answer_with_live(websocket: WebSocket, wav_bytes: bytes = None, questi
         SYSTEM_PROMPT
         + "\n\nأجب بلغة الزائر مباشرة وبإجابة صوتية قصيرة لا تتجاوز جملتين."
     )
-    config = types.LiveConnectConfig(
-        response_modalities=["AUDIO"],
-        system_instruction=system_instruction,
-        speech_config=types.SpeechConfig(
+    config_fields = {
+        "response_modalities": ["AUDIO"],
+        "system_instruction": system_instruction,
+        "speech_config": types.SpeechConfig(
             voice_config=types.VoiceConfig(
-                prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                    voice_name=TTS_VOICE
-                )
+                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=TTS_VOICE)
             )
         ),
-        output_audio_transcription=types.AudioTranscriptionConfig(),
-        realtime_input_config=types.RealtimeInputConfig(
-            automatic_activity_detection=types.AutomaticActivityDetection(
-                disabled=True
-            )
-        ),
-    )
+        "output_audio_transcription": types.AudioTranscriptionConfig(),
+    }
+    if pcm:
+        # The robot sends a completed clip; close its turn explicitly instead of
+        # relying on server VAD to infer silence from a fast upload.
+        config_fields["realtime_input_config"] = types.RealtimeInputConfig(
+            automatic_activity_detection=types.AutomaticActivityDetection(disabled=True)
+        )
+    config = types.LiveConnectConfig(**config_fields)
 
     audio_started = False
     transcript_parts = []
