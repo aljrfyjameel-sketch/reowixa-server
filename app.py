@@ -47,7 +47,7 @@ SYSTEM_PROMPT = """
 أسلوبك:
 - تحدث بلغة الزائر.
 - استخدم لغة واضحة وودودة.
-- اجعل إجاباتك مختصرة ومفيدة.
+- اجعل إجاباتك الصوتية جملة أو جملتين قصيرتين، بحد أقصى 35 كلمة. ابدأ بالجواب مباشرة.
 - احترم جميع الثقافات.
 - لا تخترع معلومات تاريخية.
 - إذا لم تعرف الإجابة، وضح ذلك.
@@ -96,7 +96,8 @@ def generate_answer(message: str) -> str:
         contents=[
             SYSTEM_PROMPT,
             f"رسالة الزائر:\n{message}"
-        ]
+        ],
+        config=types.GenerateContentConfig(max_output_tokens=120)
     )
 
     answer = response.text
@@ -145,7 +146,8 @@ def understand_audio(audio_bytes: bytes) -> str:
                 "أجب بلغة السؤال نفسه، بإجابة واضحة ومختصرة."
             ),
             audio_part
-        ]
+        ],
+        config=types.GenerateContentConfig(max_output_tokens=120)
     )
 
     if not response.text:
@@ -243,7 +245,7 @@ async def send_audio_stream(
     })
 
     # Keep frames small for ESP32
-    chunk_size = 2048
+    chunk_size = 4096
 
     for offset in range(0, len(pcm), chunk_size):
         await websocket.send_bytes(
