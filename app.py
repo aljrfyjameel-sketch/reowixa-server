@@ -26,8 +26,8 @@ if not API_KEY:
 
 client = genai.Client(api_key=API_KEY) if API_KEY else None
 
-CHAT_MODEL = "gemini-3.8-flash"
-TTS_MODEL = "gemini-3.8-flash-tts"
+CHAT_MODEL = "gemini-3.5-flash-lite"
+TTS_MODEL = "gemini-2.5-flash-preview-tts"
 
 SYSTEM_PROMPT = """
 أنت RIWEXA، روبوت ثقافي سعودي ذكي.
