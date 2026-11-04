@@ -382,7 +382,9 @@ async def answer_with_live(websocket: WebSocket, wav_bytes: bytes = None, questi
                                 "bits": 16,
                             })
                             audio_started = True
-                        await websocket.send_bytes(audio)
+                        # Match the small binary frames handled reliably by the ESP32 sketch.
+                        for offset in range(0, len(audio), 2048):
+                            await websocket.send_bytes(audio[offset:offset + 2048])
 
                 if content.turn_complete:
                     break
