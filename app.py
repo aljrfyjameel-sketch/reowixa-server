@@ -329,6 +329,7 @@ async def answer_with_live(websocket: WebSocket, wav_bytes: bytes = None, questi
     config = types.LiveConnectConfig(**config_fields)
 
     audio_started = False
+    audio_output = bytearray()
     transcript_parts = []
     try:
         async with client.aio.live.connect(model=LIVE_MODEL, config=config) as session:
@@ -375,29 +376,32 @@ async def answer_with_live(websocket: WebSocket, wav_bytes: bytes = None, questi
                         if not audio:
                             continue
 
-                        if not audio_started:
-                            await websocket.send_json({
-                                "type": "audio_start",
-                                "format": "pcm_s16le",
-                                "sample_rate": 24000,
-                                "channels": 1,
-                                "bits": 16,
-                            })
-                            audio_started = True
-                        # Match the small binary frames handled reliably by the ESP32 sketch.
-                        for offset in range(0, len(audio), 2048):
-                            await websocket.send_bytes(audio[offset:offset + 2048])
+                        audio_output.extend(audio)
+                        if len(audio_output) > 1_000_000:
+                            raise ValueError("Gemini Live answer exceeded audio buffer limit")
 
                 if content.turn_complete:
                     break
 
-        if not audio_started:
+        if not audio_output:
             return False
 
         answer = "".join(transcript_parts).strip()
         if answer:
             await websocket.send_json({"type": "response", "message": answer})
             await websocket.send_json({"type": "transcript_answer", "text": answer})
+
+        # Wait for the complete Live answer, then deliver it in a steady stream.
+        await websocket.send_json({
+            "type": "audio_start",
+            "format": "pcm_s16le",
+            "sample_rate": 24000,
+            "channels": 1,
+            "bits": 16,
+        })
+        audio_started = True
+        for offset in range(0, len(audio_output), 2048):
+            await websocket.send_bytes(audio_output[offset:offset + 2048])
         await websocket.send_json({"type": "audio_end"})
         return True
 
