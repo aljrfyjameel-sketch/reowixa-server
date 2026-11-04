@@ -288,7 +288,7 @@ async def speak_message(
 # Low-latency audio-to-audio response
 # ==========================================
 
-async def answer_with_live_audio(websocket: WebSocket, wav_bytes: bytes) -> bool:
+async def answer_with_live(websocket: WebSocket, wav_bytes: bytes = None, question: str = None) -> bool:
     """Stream a recorded visitor question through Gemini Live and relay its audio.
 
     Returns False only when Live fails before sending any audio, so the caller can
@@ -297,14 +297,18 @@ async def answer_with_live_audio(websocket: WebSocket, wav_bytes: bytes) -> bool
     if not client:
         return False
 
-    with wave.open(io.BytesIO(wav_bytes), "rb") as wav:
-        if wav.getnchannels() != 1 or wav.getsampwidth() != 2:
-            raise ValueError("Live input must be mono PCM16 WAV")
-        sample_rate = wav.getframerate()
-        pcm = wav.readframes(wav.getnframes())
-
-    if sample_rate not in (16000, 24000) or not pcm:
-        raise ValueError("Unsupported or empty Live audio input")
+    pcm = b""
+    sample_rate = 16000
+    if wav_bytes is not None:
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wav:
+            if wav.getnchannels() != 1 or wav.getsampwidth() != 2:
+                raise ValueError("Live input must be mono PCM16 WAV")
+            sample_rate = wav.getframerate()
+            pcm = wav.readframes(wav.getnframes())
+        if sample_rate not in (16000, 24000) or not pcm:
+            raise ValueError("Unsupported or empty Live audio input")
+    elif not question:
+        return False
 
     system_instruction = (
         SYSTEM_PROMPT
@@ -327,16 +331,24 @@ async def answer_with_live_audio(websocket: WebSocket, wav_bytes: bytes) -> bool
     transcript_parts = []
     try:
         async with client.aio.live.connect(model=LIVE_MODEL, config=config) as session:
-            chunk_size = 4096
-            mime_type = f"audio/pcm;rate={sample_rate}"
-            for offset in range(0, len(pcm), chunk_size):
-                await session.send_realtime_input(
-                    audio=types.Blob(
-                        data=pcm[offset:offset + chunk_size],
-                        mime_type=mime_type,
+            if pcm:
+                chunk_size = 4096
+                mime_type = f"audio/pcm;rate={sample_rate}"
+                for offset in range(0, len(pcm), chunk_size):
+                    await session.send_realtime_input(
+                        audio=types.Blob(
+                            data=pcm[offset:offset + chunk_size],
+                            mime_type=mime_type,
+                        )
                     )
+                await session.send_realtime_input(audio_stream_end=True)
+            else:
+                await session.send_client_content(
+                    turns=types.Content(
+                        role="user", parts=[types.Part.from_text(text=question)]
+                    ),
+                    turn_complete=True,
                 )
-            await session.send_realtime_input(audio_stream_end=True)
 
             async for response in session.receive():
                 content = response.server_content
@@ -411,19 +423,13 @@ async def process_question(
             "message": "جارٍ فهم سؤالك..."
         })
 
+        if await answer_with_live(websocket, wav_bytes=audio_bytes, question=question):
+            return
         if audio_bytes is not None:
-            if await answer_with_live_audio(websocket, audio_bytes):
-                return
             logger.warning("Falling back to standard audio question path")
-            answer = await asyncio.to_thread(
-                understand_audio,
-                audio_bytes
-            )
+            answer = await asyncio.to_thread(understand_audio, audio_bytes)
         else:
-            answer = await asyncio.to_thread(
-                generate_answer,
-                question
-            )
+            answer = await asyncio.to_thread(generate_answer, question)
 
         await websocket.send_json({
             "type": "response",
