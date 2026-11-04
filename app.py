@@ -24,9 +24,10 @@ app = FastAPI(title="RIWEXA Saudi Cultural Robot")
 API_KEY = os.getenv("GEMINI_API_KEY")
 client = genai.Client(api_key=API_KEY) if API_KEY else None
 
-CHAT_MODEL = "gemini-3.5-flash-lite"
-TTS_MODEL = "gemini-2.5-flash-preview-tts"
-TTS_VOICE = "Kore"
+CHAT_MODEL = os.getenv("GEMINI_CHAT_MODEL", "gemini-3.5-flash-lite")
+TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-3.1-flash-tts-preview")
+TTS_VOICE = os.getenv("GEMINI_TTS_VOICE", "Kore")
+MAX_PCM_BYTES = 320_000  # ten seconds, 16 kHz, mono PCM16
 
 SYSTEM_PROMPT = """
 أنت RIWEXA، روبوت ثقافي سعودي ذكي.
@@ -124,8 +125,8 @@ def understand_audio(audio_bytes: bytes) -> str:
         if wav.getsampwidth() != 2:
             raise ValueError("Audio must be 16-bit PCM")
 
-        if wav.getframerate() != 16000:
-            raise ValueError("Audio must be 16000 Hz")
+        if wav.getframerate() not in (16000, 24000):
+            raise ValueError("Audio must be 16000 or 24000 Hz")
 
         if wav.getnframes() == 0:
             raise ValueError("Audio is empty")
@@ -235,6 +236,7 @@ async def send_audio_stream(
 
     await websocket.send_json({
         "type": "audio_start",
+        "format": "pcm_s16le",
         "sample_rate": sample_rate,
         "channels": 1,
         "bits": 16
@@ -309,6 +311,10 @@ async def process_question(
             "type": "response",
             "message": answer
         })
+        await websocket.send_json({
+            "type": "transcript_answer",
+            "text": answer
+        })
 
         pcm, rate = await asyncio.to_thread(
             make_speech,
@@ -334,15 +340,23 @@ async def process_question(
 # WebSocket
 # ==========================================
 
+@app.websocket("/ws")
 @app.websocket("/")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
 
     logger.info("RIWEXA connected")
+    pcm_upload = bytearray()
+    pcm_rate = 16000
+    receiving_pcm = False
 
     try:
+        await websocket.send_json({"type": "ready", "protocol": 1})
         while True:
             data = await websocket.receive()
+            if data.get("type") == "websocket.disconnect":
+                logger.info("RIWEXA disconnected")
+                break
 
             # ------------------------------
             # Incoming WAV from ESP32
@@ -351,6 +365,20 @@ async def websocket_endpoint(websocket: WebSocket):
             if data.get("bytes") is not None:
                 audio_bytes = data["bytes"]
 
+                # Protocol v1 upload: binary PCM16 chunks between audio_start/audio_end.
+                if receiving_pcm:
+                    if len(pcm_upload) + len(audio_bytes) > MAX_PCM_BYTES:
+                        pcm_upload.clear()
+                        receiving_pcm = False
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": "التسجيل أطول من الحد المسموح."
+                        })
+                        continue
+                    pcm_upload.extend(audio_bytes)
+                    continue
+
+                # Backwards compatibility with the previous one-frame WAV upload.
                 if len(audio_bytes) < 44:
                     await websocket.send_json({
                         "type": "error",
@@ -385,6 +413,65 @@ async def websocket_endpoint(websocket: WebSocket):
                     continue
 
                 message_type = message.get("type")
+
+                # Start a chunked PCM16 upload.
+                if message_type == "audio_start":
+                    if receiving_pcm:
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": "يوجد تسجيل قيد الإرسال بالفعل."
+                        })
+                        continue
+                    if (
+                        message.get("format") != "pcm_s16le"
+                        or message.get("channels") != 1
+                    ):
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": "تنسيق الصوت غير مدعوم."
+                        })
+                        continue
+                    try:
+                        pcm_rate = int(message.get("sample_rate", 16000))
+                    except (TypeError, ValueError):
+                        pcm_rate = 0
+                    if pcm_rate not in (16000, 24000):
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": "معدل العينة غير مدعوم."
+                        })
+                        continue
+                    pcm_upload.clear()
+                    receiving_pcm = True
+                    continue
+
+                if message_type == "audio_end":
+                    if not receiving_pcm:
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": "لا يوجد تسجيل لاستكماله."
+                        })
+                        continue
+                    receiving_pcm = False
+                    captured_pcm = bytes(pcm_upload)
+                    pcm_upload.clear()
+                    if len(captured_pcm) < pcm_rate * 2 // 5:
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": "التسجيل قصير جداً."
+                        })
+                        continue
+                    wav_buffer = io.BytesIO()
+                    with wave.open(wav_buffer, "wb") as wav_file:
+                        wav_file.setnchannels(1)
+                        wav_file.setsampwidth(2)
+                        wav_file.setframerate(pcm_rate)
+                        wav_file.writeframes(captured_pcm)
+                    await process_question(
+                        websocket,
+                        audio_bytes=wav_buffer.getvalue()
+                    )
+                    continue
 
                 # Ping
                 if message_type == "ping":
@@ -497,3 +584,4 @@ async def websocket_endpoint(websocket: WebSocket):
 @app.on_event("startup")
 async def startup_event():
     logger.info("RIWEXA Saudi Cultural Robot started")
+
