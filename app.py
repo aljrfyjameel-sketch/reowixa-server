@@ -3,6 +3,7 @@ import os
 import io
 import re
 import wave
+import json
 import asyncio
 import logging
 
@@ -23,11 +24,9 @@ app = FastAPI(title="RIWEXA Saudi Cultural Robot")
 API_KEY = os.getenv("GEMINI_API_KEY")
 client = genai.Client(api_key=API_KEY) if API_KEY else None
 
-if not API_KEY:
-    logger.warning("GEMINI_API_KEY is missing")
-
 CHAT_MODEL = "gemini-3.5-flash-lite"
 TTS_MODEL = "gemini-2.5-flash-preview-tts"
+TTS_VOICE = "Kore"
 
 SYSTEM_PROMPT = """
 أنت RIWEXA، روبوت ثقافي سعودي ذكي.
@@ -43,21 +42,20 @@ SYSTEM_PROMPT = """
 5. التعريف بالحرف اليدوية والأزياء والأكلات السعودية.
 6. التعريف بالمعالم والمتاحف والمواقع الثقافية.
 7. مساعدة الزوار من مختلف اللغات والقدرات.
-8. تقديم تجربة ثقافية تفاعلية وممتعة.
 
 أسلوبك:
 - تحدث بلغة الزائر.
 - استخدم لغة واضحة وودودة.
 - اجعل إجاباتك مختصرة ومفيدة.
 - احترم جميع الثقافات.
-- لا تخترع معلومات تاريخية أو حقائق.
+- لا تخترع معلومات تاريخية.
 - إذا لم تعرف الإجابة، وضح ذلك.
-- لا تدّعِ أنك ترى الزائر أو المكان دون بيانات متاحة.
+- لا تدّعِ أنك ترى الزائر أو المكان دون بيانات.
 
-تذكر:
 أنت RIWEXA، الروبوت الثقافي السعودي.
 مهمتك جعل الثقافة السعودية أقرب إلى الجميع.
 """
+
 
 # ==========================================
 # HTTP
@@ -68,7 +66,6 @@ async def home():
     return {
         "status": "ok",
         "service": "RIWEXA",
-        "identity": "Saudi Cultural Robot",
         "chat": "ready",
         "voice": "ready",
         "websocket": "ready"
@@ -91,7 +88,7 @@ async def health():
 
 def generate_answer(message: str) -> str:
     if not client:
-        raise RuntimeError("Gemini API key is not configured")
+        raise RuntimeError("GEMINI_API_KEY is missing")
 
     response = client.models.generate_content(
         model=CHAT_MODEL,
@@ -110,26 +107,28 @@ def generate_answer(message: str) -> str:
 
 
 # ==========================================
-# Understand incoming WAV audio
+# Understand incoming WAV
 # ==========================================
 
 def understand_audio(audio_bytes: bytes) -> str:
     if not client:
-        raise RuntimeError("Gemini API key is not configured")
+        raise RuntimeError("GEMINI_API_KEY is missing")
 
     if not audio_bytes.startswith(b"RIFF"):
-        raise ValueError("Audio must be a valid WAV file")
+        raise ValueError("Invalid WAV file")
 
-    # Validate WAV structure
-    with wave.open(io.BytesIO(audio_bytes), "rb") as wav_file:
-        if wav_file.getnchannels() != 1:
-            raise ValueError("Input audio must be mono")
+    with wave.open(io.BytesIO(audio_bytes), "rb") as wav:
+        if wav.getnchannels() != 1:
+            raise ValueError("Audio must be mono")
 
-        if wav_file.getsampwidth() != 2:
-            raise ValueError("Input audio must be 16-bit PCM")
+        if wav.getsampwidth() != 2:
+            raise ValueError("Audio must be 16-bit PCM")
 
-        if wav_file.getframerate() != 16000:
-            raise ValueError("Input audio must be 16000 Hz")
+        if wav.getframerate() != 16000:
+            raise ValueError("Audio must be 16000 Hz")
+
+        if wav.getnframes() == 0:
+            raise ValueError("Audio is empty")
 
     audio_part = types.Part.from_bytes(
         data=audio_bytes,
@@ -141,8 +140,8 @@ def understand_audio(audio_bytes: bytes) -> str:
         contents=[
             SYSTEM_PROMPT,
             (
-                "استمع إلى تسجيل الزائر، وافهم سؤاله، "
-                "ثم أجب بلغة السؤال. اجعل الإجابة واضحة ومختصرة."
+                "استمع إلى تسجيل الزائر وافهم سؤاله. "
+                "أجب بلغة السؤال نفسه، بإجابة واضحة ومختصرة."
             ),
             audio_part
         ]
@@ -160,7 +159,7 @@ def understand_audio(audio_bytes: bytes) -> str:
 
 def make_speech(text: str) -> tuple[bytes, int]:
     if not client:
-        raise RuntimeError("Gemini API key is not configured")
+        raise RuntimeError("GEMINI_API_KEY is missing")
 
     response = client.models.generate_content(
         model=TTS_MODEL,
@@ -170,7 +169,7 @@ def make_speech(text: str) -> tuple[bytes, int]:
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                        voice_name="Kore"
+                        voice_name=TTS_VOICE
                     )
                 )
             )
@@ -179,55 +178,51 @@ def make_speech(text: str) -> tuple[bytes, int]:
 
     for candidate in response.candidates or []:
         for part in candidate.content.parts or []:
-            if not part.inline_data:
+            inline = part.inline_data
+
+            if not inline or not inline.data:
                 continue
 
-            audio = part.inline_data.data
-            mime = part.inline_data.mime_type or ""
+            audio = inline.data
+            mime = inline.mime_type or ""
 
-            if not audio:
-                continue
-
-            # If provider already returned WAV, extract PCM.
+            # Provider returned WAV
             if audio.startswith(b"RIFF"):
-                with wave.open(io.BytesIO(audio), "rb") as wf:
-                    if wf.getnchannels() != 1:
+                with wave.open(io.BytesIO(audio), "rb") as wav:
+                    if wav.getnchannels() != 1:
                         raise ValueError("TTS WAV must be mono")
 
-                    if wf.getsampwidth() != 2:
+                    if wav.getsampwidth() != 2:
                         raise ValueError("TTS WAV must be 16-bit PCM")
 
-                    sample_rate = wf.getframerate()
-                    pcm = wf.readframes(wf.getnframes())
+                    rate = wav.getframerate()
+                    pcm = wav.readframes(wav.getnframes())
 
-                return pcm, sample_rate
+                return pcm, rate
 
-            # Gemini TTS normally returns raw PCM.
-            # Default rate is 24000 Hz if MIME omits it.
-            sample_rate = 24000
-
+            # Raw PCM
+            rate = 24000
             match = re.search(r"rate=(\d+)", mime, re.IGNORECASE)
+
             if match:
-                sample_rate = int(match.group(1))
+                rate = int(match.group(1))
 
             if mime and not (
                 "pcm" in mime.lower()
                 or "l16" in mime.lower()
             ):
-                raise ValueError(
-                    f"Unsupported TTS MIME type: {mime}"
-                )
+                raise ValueError(f"Unsupported audio MIME: {mime}")
 
             if len(audio) % 2:
-                raise ValueError("PCM data has an incomplete sample")
+                raise ValueError("Invalid 16-bit PCM length")
 
-            return audio, sample_rate
+            return audio, rate
 
-    raise RuntimeError("No audio returned by Gemini")
+    raise RuntimeError("Gemini returned no audio")
 
 
 # ==========================================
-# Stream PCM in small WebSocket frames
+# Send PCM to ESP32
 # ==========================================
 
 async def send_audio_stream(
@@ -235,11 +230,8 @@ async def send_audio_stream(
     pcm: bytes,
     sample_rate: int
 ):
-    if not pcm:
-        raise ValueError("Empty TTS audio")
-
-    if len(pcm) % 2:
-        raise ValueError("PCM must contain 16-bit samples")
+    if not pcm or len(pcm) % 2:
+        raise ValueError("Invalid PCM audio")
 
     await websocket.send_json({
         "type": "audio_start",
@@ -248,8 +240,8 @@ async def send_audio_stream(
         "bits": 16
     })
 
-    # Small frames for ESP32 WebSocket client.
-    chunk_size = 4096
+    # Keep frames small for ESP32
+    chunk_size = 2048
 
     for offset in range(0, len(pcm), chunk_size):
         await websocket.send_bytes(
@@ -262,7 +254,33 @@ async def send_audio_stream(
 
 
 # ==========================================
-# Process a text or audio question
+# Speak a fixed message
+# Welcome / Goodbye
+# ==========================================
+
+async def speak_message(
+    websocket: WebSocket,
+    message: str
+):
+    await websocket.send_json({
+        "type": "status",
+        "message": "RIWEXA تتحدث..."
+    })
+
+    pcm, rate = await asyncio.to_thread(
+        make_speech,
+        message
+    )
+
+    await send_audio_stream(
+        websocket,
+        pcm,
+        rate
+    )
+
+
+# ==========================================
+# Process visitor question
 # ==========================================
 
 async def process_question(
@@ -273,8 +291,7 @@ async def process_question(
     try:
         await websocket.send_json({
             "type": "status",
-            "message": "أستمع إلى سؤالك..."
-            if audio_bytes else "أبحث عن الإجابة..."
+            "message": "جارٍ فهم سؤالك..."
         })
 
         if audio_bytes is not None:
@@ -293,7 +310,7 @@ async def process_question(
             "message": answer
         })
 
-        pcm, sample_rate = await asyncio.to_thread(
+        pcm, rate = await asyncio.to_thread(
             make_speech,
             answer
         )
@@ -301,7 +318,7 @@ async def process_question(
         await send_audio_stream(
             websocket,
             pcm,
-            sample_rate
+            rate
         )
 
     except Exception:
@@ -321,13 +338,16 @@ async def process_question(
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
 
-    logger.info("RIWEXA client connected")
+    logger.info("RIWEXA connected")
 
     try:
         while True:
             data = await websocket.receive()
 
-            # Binary WAV from ESP32
+            # ------------------------------
+            # Incoming WAV from ESP32
+            # ------------------------------
+
             if data.get("bytes") is not None:
                 audio_bytes = data["bytes"]
 
@@ -341,7 +361,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 if len(audio_bytes) > 2 * 1024 * 1024:
                     await websocket.send_json({
                         "type": "error",
-                        "message": "حجم التسجيل كبير جداً."
+                        "message": "التسجيل كبير جداً."
                     })
                     continue
 
@@ -350,10 +370,11 @@ async def websocket_endpoint(websocket: WebSocket):
                     audio_bytes=audio_bytes
                 )
 
-            # JSON text / ping
-            elif data.get("text") is not None:
-                import json
+            # ------------------------------
+            # Incoming JSON
+            # ------------------------------
 
+            elif data.get("text") is not None:
                 try:
                     message = json.loads(data["text"])
                 except json.JSONDecodeError:
@@ -365,12 +386,76 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 message_type = message.get("type")
 
+                # Ping
                 if message_type == "ping":
                     await websocket.send_json({
                         "type": "pong"
                     })
                     continue
 
+                # Visitor arrived
+                if (
+                    message_type == "event"
+                    and message.get("event") == "visitor_arrived"
+                ):
+                    language = message.get("language", "ar")
+
+                    if language == "en":
+                        greeting = (
+                            "Hello and welcome! "
+                            "I am RIWEXA, your Saudi cultural guide. "
+                            "You can ask me about Saudi history and heritage."
+                        )
+                    else:
+                        greeting = (
+                            "أهلاً وسهلاً بكم! "
+                            "أنا ريوكسا، دليلكم الثقافي السعودي. "
+                            "اسألوني عن تاريخ المملكة وتراثها."
+                        )
+
+                    try:
+                        await speak_message(websocket, greeting)
+                    except Exception:
+                        logger.exception("Welcome speech failed")
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": "تعذر تشغيل الترحيب الصوتي."
+                        })
+
+                    continue
+
+                # Visitor left
+                if (
+                    message_type == "event"
+                    and message.get("event") == "visitor_left"
+                ):
+                    language = message.get("language", "ar")
+
+                    if language == "en":
+                        goodbye = (
+                            "Thank you for visiting. "
+                            "We hope you enjoyed discovering Saudi culture. "
+                            "Have a wonderful day!"
+                        )
+                    else:
+                        goodbye = (
+                            "شكراً لزيارتكم! "
+                            "سعدتُ بمشاركتكم التعرف على الثقافة السعودية. "
+                            "نتمنى لكم يوماً سعيداً."
+                        )
+
+                    try:
+                        await speak_message(websocket, goodbye)
+                    except Exception:
+                        logger.exception("Goodbye speech failed")
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": "تعذر تشغيل رسالة الوداع."
+                        })
+
+                    continue
+
+                # Text question
                 if message_type == "text":
                     user_message = str(
                         message.get("message", "")
@@ -395,14 +480,15 @@ async def websocket_endpoint(websocket: WebSocket):
                         question=user_message
                     )
 
-                else:
-                    await websocket.send_json({
-                        "type": "error",
-                        "message": "نوع الرسالة غير معروف."
-                    })
+                    continue
+
+                await websocket.send_json({
+                    "type": "error",
+                    "message": "نوع الرسالة غير معروف."
+                })
 
     except WebSocketDisconnect:
-        logger.info("RIWEXA client disconnected")
+        logger.info("RIWEXA disconnected")
 
     except Exception:
         logger.exception("WebSocket connection error")
