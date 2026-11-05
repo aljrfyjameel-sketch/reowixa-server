@@ -1,3 +1,4 @@
-fastapi
-uvicorn
-google-genai
+flask
+flask-cors
+openai
+gunicorn
