@@ -1,47 +1,48 @@
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 import os
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-from openai import OpenAI
+import google.generativeai as genai
 
-app = Flask(__name__)
-CORS(app)
+app = FastAPI()
 
-# ياخذ المفتاح من Render Environment
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-SYSTEM = "انت رويكسا، مرشد ثقافي سعودي، ترد ب 15 كلمة فقط عن سيف والعلا والدرعية."
+# مفتاح Gemini من Render Environment
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+model = genai.GenerativeModel("gemini-1.5-flash")
 
-# === كل الروابط تشتغل GET و POST عشان ما يطلع 404 ===
-@app.route('/')
+SYSTEM = "انت رويكسا، جهاز ثقافي محمول باليد، مرشد سياحي سعودي، ترد باللهجة البيضاء مختصر جدا 12-18 كلمة فقط عن العلا والدرعية وسيف 2026."
+
+@app.get("/")
 def home():
-    return "RIWEXA Server ONLINE - use /api/text"
+    return {"status": "RIWEXA Gemini ONLINE"}
 
-@app.route('/api/text', methods=['GET', 'POST'])
-@app.route('/api/roixa', methods=['GET', 'POST'])
-def universal_api():
+@app.api_route("/api/text", methods=["GET", "POST"])
+@app.api_route("/api/roixa", methods=["GET", "POST"])
+async def universal_api(request: Request):
     try:
-        # يشتغل سواء ارسلت ?text= او JSON
-        if request.method == 'GET':
-            q = request.args.get('text', 'رحب بالزائر')
+        if request.method == "GET":
+            q = request.query_params.get("text", "رحب بالزائر")
         else:
-            data = request.get_json(silent=True) or {}
-            q = data.get('text') or request.form.get('text') or 'رحب بالزائر'
+            try:
+                body = await request.json()
+                q = body.get("text", "رحب بالزائر")
+            except:
+                form = await request.form()
+                q = form.get("text", "رحب بالزائر")
 
-        completion = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": SYSTEM},
-                {"role": "user", "content": q}
-            ],
-            max_tokens=80
-        )
-        ans = completion.choices[0].message.content.strip()
-        return jsonify({"answer": ans, "status": "ok", "query": q})
+        # Gemini
+        prompt = f"{SYSTEM}\n\nسؤال الزائر: {q}\nرد رويكسا:"
+        response = model.generate_content(prompt)
+        ans = response.text.strip()
+        
+        return {"answer": ans, "status": "ok", "query": q}
 
     except Exception as e:
         print(f"ERROR: {e}")
-        return jsonify({"answer": "يا هلا بك في رويكسا، مرشدك في سيف 2026", "error": str(e)}), 200
-
-if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
+        return {"answer": "يا هلا والله في رويكسا مرشدك الثقافي في سيف", "error": str(e)}
