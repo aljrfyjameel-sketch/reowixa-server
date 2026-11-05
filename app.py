@@ -6,51 +6,41 @@ from openai import OpenAI
 app = Flask(__name__)
 CORS(app)
 
+# ياخذ المفتاح من Render Environment
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-SYSTEM_PROMPT = """
-انت رويكسا RIWEXA، جهاز ثقافي محمول باليد.
-مرشد سياحي سعودي، ترد باللهجة البيضاء، مختصر جدا 12-18 كلمة فقط.
-مواضيعك: العلا، الدرعية، جدة التاريخية، سيف 2026.
-"""
+SYSTEM = "انت رويكسا، مرشد ثقافي سعودي، ترد ب 15 كلمة فقط عن سيف والعلا والدرعية."
 
+# === كل الروابط تشتغل GET و POST عشان ما يطلع 404 ===
 @app.route('/')
 def home():
-    return "RIWEXA Server ONLINE"
+    return "RIWEXA Server ONLINE - use /api/text"
 
-@app.route('/api/text', methods=['POST'])
-def ask_text():
+@app.route('/api/text', methods=['GET', 'POST'])
+@app.route('/api/roixa', methods=['GET', 'POST'])
+def universal_api():
     try:
-        data = request.get_json(force=True)
-        user_q = data.get('text', 'رحب بالزائر')
+        # يشتغل سواء ارسلت ?text= او JSON
+        if request.method == 'GET':
+            q = request.args.get('text', 'رحب بالزائر')
+        else:
+            data = request.get_json(silent=True) or {}
+            q = data.get('text') or request.form.get('text') or 'رحب بالزائر'
+
         completion = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_q}
-            ],
-            max_tokens=80
-        )
-        answer = completion.choices[0].message.content.strip()
-        return jsonify({"answer": answer, "status": "ok"})
-    except Exception as e:
-        return jsonify({"answer": "يا هلا بك في رويكسا مرشدك الثقافي", "error": str(e)})
-
-@app.route('/api/roixa', methods=['GET'])
-def ask_get():
-    q = request.args.get('text', 'معلومة عن العلا')
-    try:
-        completion = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": SYSTEM},
                 {"role": "user", "content": q}
             ],
             max_tokens=80
         )
-        return jsonify({"answer": completion.choices[0].message.content.strip()})
+        ans = completion.choices[0].message.content.strip()
+        return jsonify({"answer": ans, "status": "ok", "query": q})
+
     except Exception as e:
-        return jsonify({"answer": "أهلا بك في رويكسا", "error": str(e)})
+        print(f"ERROR: {e}")
+        return jsonify({"answer": "يا هلا بك في رويكسا، مرشدك في سيف 2026", "error": str(e)}), 200
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
