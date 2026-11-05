@@ -5,7 +5,9 @@ import re
 import json
 import wave
 import base64
+import asyncio
 import logging
+from contextlib import suppress
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
@@ -13,10 +15,10 @@ from google import genai
 from google.genai import types
 
 
-# ==========================================
-# RIWEXA - Saudi Cultural Robot
-# Native Voice-to-Voice
-# ==========================================
+# ============================================================
+# RIWEXA - Persistent Gemini Live Session
+# Native Audio | Arabic + English | ESP32-S3
+# ============================================================
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("RIWEXA")
@@ -24,69 +26,57 @@ logger = logging.getLogger("RIWEXA")
 app = FastAPI(title="RIWEXA Saudi Cultural Robot")
 
 API_KEY = os.getenv("GEMINI_API_KEY")
+LIVE_MODEL = os.getenv("GEMINI_LIVE_MODEL", "gemini-3.8-live")
+TTS_VOICE = os.getenv("GEMINI_TTS_VOICE", "Kore")
 
 client = genai.Client(api_key=API_KEY) if API_KEY else None
 
-LIVE_MODEL = os.getenv(
-    "GEMINI_LIVE_MODEL",
-    "gemini-3.8-live"
-)
-
-TTS_VOICE = os.getenv(
-    "GEMINI_TTS_VOICE",
-    "Kore"
-)
-
 MAX_PCM_BYTES = 320_000
-
 MAX_TEXT_LENGTH = 4000
-
 AUDIO_CHUNK_SIZE = 2048
-
 SUPPORTED_SAMPLE_RATES = (16000, 24000)
 
-
 SYSTEM_PROMPT = """
-أنت RIWEXA، روبوت ثقافي سعودي ذكي.
+You are RIWEXA, a Saudi cultural guide robot.
 
-أنت سفير رقمي للثقافة السعودية، تساعد الزوار
-على اكتشاف تاريخ المملكة وتراثها وهويتها الثقافية.
+You help visitors discover:
+- Saudi history and heritage.
+- Saudi regions and traditions.
+- Museums, historical sites and landmarks.
+- Traditional arts, crafts, clothing and food.
+- Saudi culture and national identity.
 
-أهدافك:
-1. التعريف بتاريخ المملكة العربية السعودية.
-2. التعريف بالمناطق السعودية وتراثها.
-3. شرح المواقع التاريخية والأثرية.
-4. التعريف بالعادات والتقاليد والفنون الشعبية.
-5. التعريف بالحرف اليدوية والأزياء والأكلات السعودية.
-6. التعريف بالمعالم والمتاحف والمواقع الثقافية.
-7. مساعدة الزوار من مختلف اللغات والقدرات.
+LANGUAGE:
+- Automatically identify the language spoken by the visitor.
+- If the visitor speaks Arabic, answer in natural Arabic.
+- If the visitor speaks English, answer in natural English.
+- If the visitor changes language, immediately follow the latest language.
+- Never ask the visitor to choose a language.
+- Keep the conversation context across all questions in this visit.
 
-أسلوبك:
-- تحدث بلغة الزائر.
-- استخدم لغة واضحة وودودة.
-- اجعل إجاباتك مفيدة ومكتملة.
-- لا تختصر المعلومات الضرورية.
-- احترم جميع الثقافات.
-- لا تخترع معلومات تاريخية.
-- إذا لم تعرف الإجابة، وضح ذلك.
-- لا تدّعِ أنك ترى الزائر أو المكان دون بيانات.
+BEHAVIOR:
+- Be welcoming, clear, friendly and informative.
+- Do not invent historical facts, dates or sources.
+- If you do not know something, say so honestly.
+- Do not claim to see the visitor or surroundings.
+- Keep spoken answers appropriate for a public exhibition.
 
-أنت RIWEXA، الروبوت الثقافي السعودي.
-مهمتك جعل الثقافة السعودية أقرب إلى الجميع.
+AUDIO:
+- Always answer using native audio.
+- Do not replace spoken answers with text.
+- Speak naturally and clearly.
 """
 
-
-# ==========================================
+# ============================================================
 # HTTP
-# ==========================================
+# ============================================================
 
 @app.get("/")
 async def home():
     return {
         "status": "ok",
         "service": "RIWEXA",
-        "voice": "Gemini Live Native Audio",
-        "websocket": "ready"
+        "mode": "persistent-native-audio"
     }
 
 
@@ -98,22 +88,33 @@ async def health_head():
 @app.get("/health")
 async def health():
     return {
-        "status": "healthy",
+        "status": "healthy" if client else "missing_api_key",
         "service": "RIWEXA",
-        "gemini": "configured" if client else "missing_api_key"
+        "model": LIVE_MODEL
     }
 
 
-# ==========================================
-# Audio utilities
-# ==========================================
+# ============================================================
+# Audio helpers
+# ============================================================
 
-def read_wav_audio(audio_bytes: bytes):
-    if not audio_bytes.startswith(b"RIFF"):
+def make_wav(pcm: bytes, rate: int) -> bytes:
+    buffer = io.BytesIO()
+
+    with wave.open(buffer, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(rate)
+        wav.writeframes(pcm)
+
+    return buffer.getvalue()
+
+
+def read_wav_audio(data: bytes):
+    if not data.startswith(b"RIFF"):
         raise ValueError("Invalid WAV file")
 
-    with wave.open(io.BytesIO(audio_bytes), "rb") as wav:
-
+    with wave.open(io.BytesIO(data), "rb") as wav:
         if wav.getnchannels() != 1:
             raise ValueError("Audio must be mono")
 
@@ -123,935 +124,780 @@ def read_wav_audio(audio_bytes: bytes):
         rate = wav.getframerate()
 
         if rate not in SUPPORTED_SAMPLE_RATES:
-            raise ValueError("Unsupported audio sample rate")
-
-        if wav.getnframes() == 0:
-            raise ValueError("Audio is empty")
+            raise ValueError("Unsupported sample rate")
 
         pcm = wav.readframes(wav.getnframes())
 
-    if not pcm:
-        raise ValueError("Audio is empty")
-
-    if len(pcm) % 2:
-        raise ValueError("Invalid PCM16 data")
+    if not pcm or len(pcm) % 2:
+        raise ValueError("Invalid or empty PCM audio")
 
     return pcm, rate
 
 
-def make_wav(pcm: bytes, sample_rate: int) -> bytes:
-    buffer = io.BytesIO()
-
-    with wave.open(buffer, "wb") as wav:
-        wav.setnchannels(1)
-        wav.setsampwidth(2)
-        wav.setframerate(sample_rate)
-        wav.writeframes(pcm)
-
-    return buffer.getvalue()
-
-
-# ==========================================
-# Gemini Live - Native Audio Response
-# ==========================================
-
-async def answer_with_live(
-    websocket: WebSocket,
-    wav_bytes: bytes = None,
-    question: str = None
-) -> bool:
-
-    """
-    Recorded PCM/WAV input or text input
-    -> Gemini Live
-    -> Native audio output streamed directly to ESP32.
-
-    No text-to-speech fallback.
-    """
-
-    if not client:
-        raise RuntimeError("GEMINI_API_KEY is missing")
-
-    pcm = b""
-    input_rate = 16000
-
-    if wav_bytes is not None:
-        pcm, input_rate = read_wav_audio(wav_bytes)
-
-    elif question:
-        question = question.strip()
-
-        if not question:
-            raise ValueError("Question is empty")
-
-        if len(question) > MAX_TEXT_LENGTH:
-            raise ValueError("Question is too long")
-
-    else:
-        return False
-
-    system_instruction = (
-        SYSTEM_PROMPT
-        + "\n\n"
-        + "أجب بلغة الزائر نفسها. "
-        + "استخدم إجابة صوتية واضحة وطبيعية ومكتملة. "
-        + "لا تحذف المعلومات المهمة من الإجابة."
+def get_output_rate(mime_type):
+    match = re.search(
+        r"rate=(\d+)",
+        mime_type or "",
+        re.IGNORECASE
     )
 
-    config_fields = {
-        "response_modalities": ["AUDIO"],
+    rate = int(match.group(1)) if match else 24000
 
-        "system_instruction": system_instruction,
+    if rate not in SUPPORTED_SAMPLE_RATES:
+        raise ValueError(f"Unsupported output sample rate: {rate}")
 
-        "speech_config": types.SpeechConfig(
+    return rate
+
+
+# ============================================================
+# Safe WebSocket sending
+# ============================================================
+
+async def send_json(ws, lock, payload):
+    async with lock:
+        await ws.send_json(payload)
+
+
+async def send_binary(ws, lock, payload):
+    async with lock:
+        await ws.send_bytes(payload)
+
+
+# ============================================================
+# Gemini Live response receiver
+# The same session is reused for every visitor turn.
+# ============================================================
+
+async def receive_live_turn(
+    session,
+    websocket,
+    send_lock,
+    visitor_active
+):
+    audio_started = False
+    audio_ended = False
+    audio_bytes_sent = 0
+    pending_byte = b""
+    output_rate = 24000
+    transcript_parts = []
+
+    async for response in session.receive():
+
+        content = response.server_content
+
+        if content is None:
+            continue
+
+        transcription = getattr(
+            content,
+            "output_transcription",
+            None
+        )
+
+        if transcription and transcription.text:
+            transcript_parts.append(transcription.text)
+
+        model_turn = getattr(content, "model_turn", None)
+
+        if model_turn:
+            for part in model_turn.parts or []:
+
+                inline = getattr(part, "inline_data", None)
+
+                if not inline or not inline.data:
+                    continue
+
+                raw_audio = inline.data
+
+                if isinstance(raw_audio, str):
+                    raw_audio = base64.b64decode(raw_audio)
+
+                raw_audio = bytes(raw_audio)
+
+                mime_type = getattr(inline, "mime_type", "") or ""
+
+                output_rate = get_output_rate(mime_type)
+
+                # Preserve PCM16 sample boundaries.
+                raw_audio = pending_byte + raw_audio
+                usable_length = len(raw_audio) & ~1
+
+                pending_byte = raw_audio[usable_length:]
+                raw_audio = raw_audio[:usable_length]
+
+                if not raw_audio:
+                    continue
+
+                # If the visitor has left, discard remaining
+                # response audio instead of playing it.
+                if not visitor_active.is_set():
+                    continue
+
+                if not audio_started:
+                    await send_json(
+                        websocket,
+                        send_lock,
+                        {
+                            "type": "audio_start",
+                            "format": "pcm_s16le",
+                            "sample_rate": output_rate,
+                            "channels": 1,
+                            "bits": 16
+                        }
+                    )
+
+                    audio_started = True
+
+                for offset in range(0, len(raw_audio), AUDIO_CHUNK_SIZE):
+
+                    if not visitor_active.is_set():
+                        break
+
+                    chunk = raw_audio[
+                        offset:offset + AUDIO_CHUNK_SIZE
+                    ]
+
+                    if chunk:
+                        await send_binary(
+                            websocket,
+                            send_lock,
+                            chunk
+                        )
+
+                        audio_bytes_sent += len(chunk)
+
+        if getattr(content, "interrupted", False):
+            logger.info("Gemini turn interrupted")
+            break
+
+        if getattr(content, "turn_complete", False):
+            break
+
+    # Always close an audio stream that was opened.
+    if audio_started and not audio_ended:
+        await send_json(
+            websocket,
+            send_lock,
+            {"type": "audio_end"}
+        )
+
+        audio_ended = True
+
+    transcript = "".join(transcript_parts).strip()
+
+    if transcript and visitor_active.is_set():
+        await send_json(
+            websocket,
+            send_lock,
+            {
+                "type": "transcript_answer",
+                "text": transcript
+            }
+        )
+
+    logger.info(
+        "Live turn finished: %d audio bytes at %d Hz",
+        audio_bytes_sent,
+        output_rate
+    )
+
+    return audio_bytes_sent
+
+
+# ============================================================
+# Gemini turn sender
+# ============================================================
+
+async def run_text_turn(
+    session,
+    websocket,
+    send_lock,
+    visitor_active,
+    prompt
+):
+    await session.send_realtime_input(text=prompt)
+
+    return await receive_live_turn(
+        session,
+        websocket,
+        send_lock,
+        visitor_active
+    )
+
+
+async def run_audio_turn(
+    session,
+    websocket,
+    send_lock,
+    visitor_active,
+    pcm,
+    sample_rate
+):
+    if not pcm:
+        raise ValueError("Empty audio recording")
+
+    if len(pcm) % 2:
+        raise ValueError("PCM16 data has an incomplete sample")
+
+    # The client controls speech boundaries because
+    # automatic activity detection is disabled.
+    await session.send_realtime_input(
+        activity_start=types.ActivityStart()
+    )
+
+    chunk_size = 4096
+    mime_type = f"audio/pcm;rate={sample_rate}"
+
+    for offset in range(0, len(pcm), chunk_size):
+
+        if not visitor_active.is_set():
+            break
+
+        chunk = pcm[offset:offset + chunk_size]
+
+        await session.send_realtime_input(
+            audio=types.Blob(
+                data=chunk,
+                mime_type=mime_type
+            )
+        )
+
+    await session.send_realtime_input(
+        activity_end=types.ActivityEnd()
+    )
+
+    if not visitor_active.is_set():
+        return 0
+
+    return await receive_live_turn(
+        session,
+        websocket,
+        send_lock,
+        visitor_active
+    )
+
+
+# ============================================================
+# Persistent visitor session worker
+# One connection for the whole visit.
+# ============================================================
+
+async def visitor_worker(
+    websocket,
+    send_lock,
+    queue,
+    visitor_active
+):
+    if client is None:
+        await send_json(
+            websocket,
+            send_lock,
+            {
+                "type": "error",
+                "message": "GEMINI_API_KEY is missing on the server."
+            }
+        )
+        return
+
+    config = types.LiveConnectConfig(
+        response_modalities=["AUDIO"],
+        system_instruction=SYSTEM_PROMPT,
+        speech_config=types.SpeechConfig(
             voice_config=types.VoiceConfig(
                 prebuilt_voice_config=types.PrebuiltVoiceConfig(
                     voice_name=TTS_VOICE
                 )
             )
         ),
-
-        "output_audio_transcription": (
-            types.AudioTranscriptionConfig()
-        ),
-    }
-
-    if pcm:
-        config_fields["realtime_input_config"] = (
-            types.RealtimeInputConfig(
-                automatic_activity_detection=(
-                    types.AutomaticActivityDetection(
-                        disabled=True
-                    )
-                )
+        output_audio_transcription=types.AudioTranscriptionConfig(),
+        realtime_input_config=types.RealtimeInputConfig(
+            automatic_activity_detection=types.AutomaticActivityDetection(
+                disabled=True
             )
         )
-
-    config = types.LiveConnectConfig(**config_fields)
-
-    audio_started = False
-    audio_ended = False
-
-    audio_bytes_sent = 0
-
-    pending_byte = b""
-
-    transcript_parts = []
-
-    output_rate = 24000
+    )
 
     try:
-
         async with client.aio.live.connect(
             model=LIVE_MODEL,
             config=config
         ) as session:
 
-            # ----------------------------------
-            # Send visitor's recorded question
-            # ----------------------------------
+            logger.info("Persistent visitor session opened")
 
-            if pcm:
-
-                chunk_size = 4096
-
-                mime_type = (
-                    f"audio/pcm;rate={input_rate}"
-                )
-
-                await session.send_realtime_input(
-                    activity_start=types.ActivityStart()
-                )
-
-                for offset in range(
-                    0,
-                    len(pcm),
-                    chunk_size
-                ):
-
-                    chunk = pcm[
-                        offset:offset + chunk_size
-                    ]
-
-                    await session.send_realtime_input(
-                        audio=types.Blob(
-                            data=chunk,
-                            mime_type=mime_type
-                        )
-                    )
-
-                await session.send_realtime_input(
-                    activity_end=types.ActivityEnd()
-                )
-
-            # ----------------------------------
-            # Send text question, if applicable
-            # ----------------------------------
-
-            else:
-
-                await session.send_client_content(
-                    turns=types.Content(
-                        role="user",
-                        parts=[
-                            types.Part.from_text(
-                                text=question
-                            )
-                        ]
-                    ),
-                    turn_complete=True
-                )
-
-            # ----------------------------------
-            # Receive Gemini audio continuously
-            # ----------------------------------
-
-            async for response in session.receive():
-
-                content = response.server_content
-
-                if content is None:
-                    continue
-
-                # Optional transcription only.
-                # It is NOT used to generate speech.
-
-                transcription = getattr(
-                    content,
-                    "output_transcription",
-                    None
-                )
-
-                if (
-                    transcription
-                    and transcription.text
-                ):
-
-                    transcript_parts.append(
-                        transcription.text
-                    )
-
-                # ----------------------------------
-                # Process generated audio parts
-                # ----------------------------------
-
-                turn = content.model_turn
-
-                if turn:
-
-                    for part in turn.parts or []:
-
-                        inline = part.inline_data
-
-                        if (
-                            not inline
-                            or not inline.data
-                        ):
-                            continue
-
-                        audio = inline.data
-
-                        # The SDK normally provides bytes.
-                        # Handle base64 strings if returned.
-
-                        if isinstance(audio, str):
-                            audio = base64.b64decode(audio)
-
-                        audio = bytes(audio)
-
-                        # Preserve PCM16 sample alignment.
-
-                        audio = pending_byte + audio
-
-                        usable_length = (
-                            len(audio) & ~1
-                        )
-
-                        pending_byte = (
-                            audio[usable_length:]
-                        )
-
-                        audio = audio[:usable_length]
-
-                        if not audio:
-                            continue
-
-                        # Start speaker on first audio chunk.
-
-                        if not audio_started:
-
-                            mime = (
-                                getattr(inline, "mime_type", "")
-                                or ""
-                            )
-
-                            match = re.search(
-                                r"rate=(\d+)",
-                                mime,
-                                re.IGNORECASE
-                            )
-
-                            if match:
-                                output_rate = int(
-                                    match.group(1)
-                                )
-
-                            if output_rate not in SUPPORTED_SAMPLE_RATES:
-                                raise ValueError(
-                                    "Unsupported Gemini output sample rate"
-                                )
-
-                            await websocket.send_json({
-                                "type": "audio_start",
-                                "format": "pcm_s16le",
-                                "sample_rate": output_rate,
-                                "channels": 1,
-                                "bits": 16
-                            })
-
-                            audio_started = True
-
-                        # Send audio immediately.
-                        # No full-answer accumulation.
-
-                        for offset in range(
-                            0,
-                            len(audio),
-                            AUDIO_CHUNK_SIZE
-                        ):
-
-                            chunk = audio[
-                                offset:offset + AUDIO_CHUNK_SIZE
-                            ]
-
-                            await websocket.send_bytes(
-                                chunk
-                            )
-
-                            audio_bytes_sent += len(chunk)
-
-                # ----------------------------------
-                # Handle interruption and completion
-                # ----------------------------------
-
-                if getattr(content, "interrupted", False):
-                    logger.warning(
-                        "Gemini Live response interrupted"
-                    )
-                    break
-
-                if content.turn_complete:
-                    break
-
-        # ----------------------------------
-        # Validate completed audio
-        # ----------------------------------
-
-        if pending_byte:
-            raise ValueError(
-                "Incomplete PCM16 audio sample"
+            await send_json(
+                websocket,
+                send_lock,
+                {
+                    "type": "session",
+                    "status": "started"
+                }
             )
 
-        if not audio_started or audio_bytes_sent == 0:
-            raise RuntimeError(
-                "Gemini Live returned no audio"
-            )
+            while True:
+                job = await queue.get()
 
-        # ----------------------------------
-        # End ESP32 speaker playback
-        # ----------------------------------
+                job_type = job.get("type")
 
-        await websocket.send_json({
-            "type": "audio_end"
-        })
+                try:
+                    if job_type == "welcome":
 
-        audio_ended = True
+                        visitor_active.set()
 
-        # Optional transcript for display/debugging.
+                        await run_text_turn(
+                            session,
+                            websocket,
+                            send_lock,
+                            visitor_active,
+                            (
+                                "A visitor has arrived. "
+                                "Welcome them warmly in Arabic. "
+                                "Introduce yourself briefly as RIWEXA, "
+                                "their Saudi cultural guide. "
+                                "Then remain ready for their questions. "
+                                "Follow the visitor's spoken language "
+                                "in all later replies."
+                            )
+                        )
 
-        answer = "".join(
-            transcript_parts
-        ).strip()
+                    elif job_type == "audio":
 
-        if answer:
+                        if visitor_active.is_set():
+                            await run_audio_turn(
+                                session,
+                                websocket,
+                                send_lock,
+                                visitor_active,
+                                job["pcm"],
+                                job["rate"]
+                            )
 
-            await websocket.send_json({
-                "type": "response",
-                "message": answer
-            })
+                    elif job_type == "text":
 
-            await websocket.send_json({
-                "type": "transcript_answer",
-                "text": answer
-            })
+                        if visitor_active.is_set():
+                            await run_text_turn(
+                                session,
+                                websocket,
+                                send_lock,
+                                visitor_active,
+                                job["message"]
+                            )
 
-        logger.info(
-            "Gemini Live audio streamed: %d bytes, %d Hz",
-            audio_bytes_sent,
-            output_rate
-        )
+                    elif job_type == "goodbye":
 
-        return True
+                        # The ESP32 has confirmed the visitor left.
+                        # The same Gemini session retains the context.
+                        visitor_active.set()
 
-    except Exception as exc:
+                        await run_text_turn(
+                            session,
+                            websocket,
+                            send_lock,
+                            visitor_active,
+                            (
+                                "The visitor is leaving now. "
+                                "Give them a brief, warm goodbye. "
+                                "Use the language they most recently spoke."
+                            )
+                        )
 
-        provider_status = (
-            getattr(exc, "status_code", None)
-            or getattr(exc, "code", None)
-        )
+                        await send_json(
+                            websocket,
+                            send_lock,
+                            {
+                                "type": "session",
+                                "status": "ended"
+                            }
+                        )
 
-        logger.exception(
-            "Gemini Live failed (%s, %s)",
-            type(exc).__name__,
-            provider_status
-        )
+                        break
 
-        try:
+                except Exception as exc:
+                    logger.exception("Visitor turn failed")
 
-            await websocket.send_json({
-                "type": "diagnostic",
-                "source": "live",
-                "error_type": type(exc).__name__,
-                "status": provider_status
-            })
+                    with suppress(Exception):
+                        await send_json(
+                            websocket,
+                            send_lock,
+                            {
+                                "type": "error",
+                                "message": str(exc)[:250]
+                            }
+                        )
 
-        except Exception:
-            pass
+                    if job_type == "goodbye":
+                        break
 
-        # If audio already started, close the playback stream.
-        # Do not trigger another TTS response.
-
-        if audio_started and not audio_ended:
-
-            try:
-
-                await websocket.send_json({
-                    "type": "audio_end"
-                })
-
-                audio_ended = True
-
-            except Exception:
-                pass
-
+    except asyncio.CancelledError:
         raise
 
+    except Exception:
+        logger.exception("Persistent Gemini session failed")
 
-# ==========================================
-# Fixed messages - Welcome / Goodbye
-# ==========================================
-
-async def speak_message(
-    websocket: WebSocket,
-    message: str
-):
-
-    await websocket.send_json({
-        "type": "status",
-        "message": "RIWEXA تتحدث..."
-    })
-
-    await answer_with_live(
-        websocket,
-        question=(
-            "انطق النص التالي كما هو وبصوت ودود، "
-            "دون إضافة شرح: " + message
-        )
-    )
-
-
-# ==========================================
-# Process visitor question
-# ==========================================
-
-async def process_question(
-    websocket: WebSocket,
-    question: str = None,
-    audio_bytes: bytes = None
-):
-
-    try:
-
-        await websocket.send_json({
-            "type": "status",
-            "message": "جارٍ فهم سؤالك..."
-        })
-
-        success = await answer_with_live(
-            websocket,
-            wav_bytes=audio_bytes,
-            question=question
-        )
-
-        if not success:
-            raise RuntimeError(
-                "Gemini Live did not produce an audio response"
-            )
-
-    except Exception as exc:
-
-        provider_status = (
-            getattr(exc, "status_code", None)
-            or getattr(exc, "code", None)
-        )
-
-        logger.exception(
-            "Question processing failed (%s, %s)",
-            type(exc).__name__,
-            provider_status
-        )
-
-        try:
-
-            await websocket.send_json({
-                "type": "error",
-                "message": (
-                    "تعذر معالجة السؤال صوتياً. "
-                    "حاول مرة أخرى."
-                ),
-                "diagnostic": {
-                    "error_type": type(exc).__name__,
-                    "status": provider_status
+        with suppress(Exception):
+            await send_json(
+                websocket,
+                send_lock,
+                {
+                    "type": "error",
+                    "message": "تعذر الاتصال بخدمة Gemini Live."
                 }
-            })
-
-        except Exception:
-            logger.warning(
-                "Could not send error to disconnected ESP32"
             )
 
+    finally:
+        visitor_active.clear()
+        logger.info("Persistent visitor session closed")
 
-# ==========================================
-# WebSocket
-# ==========================================
+
+# ============================================================
+# WebSocket endpoint
+# Receives ESP32 messages while Gemini is responding.
+# ============================================================
 
 @app.websocket("/ws")
 @app.websocket("/")
-async def websocket_endpoint(
-    websocket: WebSocket
-):
+async def websocket_endpoint(websocket: WebSocket):
 
     await websocket.accept()
 
-    logger.info("RIWEXA connected")
+    logger.info("ESP32 connected")
 
-    pcm_upload = bytearray()
+    send_lock = asyncio.Lock()
 
+    pcm_buffer = bytearray()
     pcm_rate = 16000
-
     receiving_pcm = False
 
-    try:
+    visitor_active = asyncio.Event()
+    visitor_queue = asyncio.Queue()
 
-        await websocket.send_json({
-            "type": "ready",
-            "protocol": 1
-        })
+    worker_task = None
+
+    async def start_session():
+        nonlocal worker_task
+
+        if worker_task and not worker_task.done():
+            return
+
+        visitor_active.set()
+
+        worker_task = asyncio.create_task(
+            visitor_worker(
+                websocket,
+                send_lock,
+                visitor_queue,
+                visitor_active
+            )
+        )
+
+    try:
+        await send_json(
+            websocket,
+            send_lock,
+            {
+                "type": "ready",
+                "protocol": 1
+            }
+        )
 
         while True:
 
-            data = await websocket.receive()
+            packet = await websocket.receive()
 
-            if data.get("type") == "websocket.disconnect":
-
-                logger.info(
-                    "RIWEXA disconnected"
-                )
-
+            if packet.get("type") == "websocket.disconnect":
                 break
 
-            # ==================================
-            # Incoming binary audio
-            # ==================================
+            # ------------------------------------------------
+            # Binary audio
+            # ------------------------------------------------
 
-            if data.get("bytes") is not None:
+            if packet.get("bytes") is not None:
 
-                audio_bytes = data["bytes"]
-
-                if receiving_pcm:
-
-                    if (
-                        len(pcm_upload) + len(audio_bytes)
-                        > MAX_PCM_BYTES
-                    ):
-
-                        pcm_upload.clear()
-
-                        receiving_pcm = False
-
-                        await websocket.send_json({
+                if not receiving_pcm:
+                    await send_json(
+                        websocket,
+                        send_lock,
+                        {
                             "type": "error",
-                            "message": (
-                                "التسجيل أطول من الحد المسموح."
-                            )
-                        })
-
-                        continue
-
-                    pcm_upload.extend(audio_bytes)
-
-                    continue
-
-                # Backwards compatibility:
-                # previous one-frame WAV upload.
-
-                if len(audio_bytes) < 44:
-
-                    await websocket.send_json({
-                        "type": "error",
-                        "message": "ملف الصوت غير صالح."
-                    })
-
-                    continue
-
-                if len(audio_bytes) > 2 * 1024 * 1024:
-
-                    await websocket.send_json({
-                        "type": "error",
-                        "message": "التسجيل كبير جداً."
-                    })
-
-                    continue
-
-                await process_question(
-                    websocket,
-                    audio_bytes=audio_bytes
-                )
-
-            # ==================================
-            # Incoming JSON
-            # ==================================
-
-            elif data.get("text") is not None:
-
-                try:
-
-                    message = json.loads(
-                        data["text"]
+                            "message": "Unexpected binary audio data."
+                        }
                     )
-
-                except json.JSONDecodeError:
-
-                    await websocket.send_json({
-                        "type": "error",
-                        "message": "صيغة الرسالة غير صحيحة."
-                    })
-
                     continue
 
-                message_type = message.get("type")
+                chunk = packet["bytes"]
 
-                # ----------------------------------
-                # Start PCM recording upload
-                # ----------------------------------
+                if len(pcm_buffer) + len(chunk) > MAX_PCM_BYTES:
 
-                if message_type == "audio_start":
-
-                    if receiving_pcm:
-
-                        await websocket.send_json({
-                            "type": "error",
-                            "message": (
-                                "يوجد تسجيل قيد الإرسال بالفعل."
-                            )
-                        })
-
-                        continue
-
-                    if (
-                        message.get("format") != "pcm_s16le"
-                        or message.get("channels") != 1
-                    ):
-
-                        await websocket.send_json({
-                            "type": "error",
-                            "message": "تنسيق الصوت غير مدعوم."
-                        })
-
-                        continue
-
-                    try:
-
-                        pcm_rate = int(
-                            message.get(
-                                "sample_rate",
-                                16000
-                            )
-                        )
-
-                    except (TypeError, ValueError):
-
-                        pcm_rate = 0
-
-                    if pcm_rate not in SUPPORTED_SAMPLE_RATES:
-
-                        await websocket.send_json({
-                            "type": "error",
-                            "message": "معدل العينة غير مدعوم."
-                        })
-
-                        continue
-
-                    pcm_upload.clear()
-
-                    receiving_pcm = True
-
-                    continue
-
-                # ----------------------------------
-                # Finish PCM recording upload
-                # ----------------------------------
-
-                if message_type == "audio_end":
-
-                    if not receiving_pcm:
-
-                        await websocket.send_json({
-                            "type": "error",
-                            "message": (
-                                "لا يوجد تسجيل لاستكماله."
-                            )
-                        })
-
-                        continue
-
+                    pcm_buffer.clear()
                     receiving_pcm = False
 
-                    captured_pcm = bytes(
-                        pcm_upload
-                    )
-
-                    pcm_upload.clear()
-
-                    minimum_length = (
-                        pcm_rate * 2 // 5
-                    )
-
-                    if len(captured_pcm) < minimum_length:
-
-                        await websocket.send_json({
-                            "type": "error",
-                            "message": "التسجيل قصير جداً."
-                        })
-
-                        continue
-
-                    if len(captured_pcm) % 2:
-
-                        await websocket.send_json({
-                            "type": "error",
-                            "message": "بيانات التسجيل غير مكتملة."
-                        })
-
-                        continue
-
-                    wav_bytes = make_wav(
-                        captured_pcm,
-                        pcm_rate
-                    )
-
-                    await process_question(
+                    await send_json(
                         websocket,
-                        audio_bytes=wav_bytes
+                        send_lock,
+                        {
+                            "type": "error",
+                            "message": "Audio recording exceeded the limit."
+                        }
+                    )
+                    continue
+
+                pcm_buffer.extend(chunk)
+                continue
+
+            # ------------------------------------------------
+            # JSON messages
+            # ------------------------------------------------
+
+            raw_text = packet.get("text")
+
+            if raw_text is None:
+                continue
+
+            try:
+                message = json.loads(raw_text)
+            except json.JSONDecodeError:
+                await send_json(
+                    websocket,
+                    send_lock,
+                    {
+                        "type": "error",
+                        "message": "Invalid JSON."
+                    }
+                )
+                continue
+
+            msg_type = message.get("type")
+
+            # PING
+            if msg_type == "ping":
+                await send_json(
+                    websocket,
+                    send_lock,
+                    {"type": "pong"}
+                )
+                continue
+
+            # VISITOR ARRIVED
+            if (
+                msg_type == "event"
+                and message.get("event") == "visitor_arrived"
+            ):
+
+                if worker_task and not worker_task.done():
+                    logger.warning("Arrival received while session active")
+                    continue
+
+                visitor_active.set()
+                await start_session()
+
+                await visitor_queue.put(
+                    {"type": "welcome"}
+                )
+                continue
+
+            # VISITOR LEFT
+            if (
+                msg_type == "event"
+                and message.get("event") == "visitor_left"
+            ):
+
+                if worker_task and not worker_task.done():
+
+                    visitor_active.clear()
+
+                    # The worker finishes consuming the current
+                    # Live turn, discards further audio, then says goodbye.
+                    await visitor_queue.put(
+                        {"type": "goodbye"}
                     )
 
-                    continue
+                continue
 
-                # ----------------------------------
-                # Ping
-                # ----------------------------------
+            # AUDIO START
+            if msg_type == "audio_start":
 
-                if message_type == "ping":
-
-                    await websocket.send_json({
-                        "type": "pong"
-                    })
-
-                    continue
-
-                # ----------------------------------
-                # Visitor arrived
-                # ----------------------------------
-
-                if (
-                    message_type == "event"
-                    and message.get("event") == "visitor_arrived"
-                ):
-
-                    language = message.get(
-                        "language",
-                        "ar"
-                    )
-
-                    if language == "en":
-
-                        greeting = (
-                            "Hello and welcome! "
-                            "I am RIWEXA, your Saudi cultural guide. "
-                            "You can ask me about Saudi history and heritage."
-                        )
-
-                    else:
-
-                        greeting = (
-                            "أهلاً وسهلاً بكم! "
-                            "أنا ريوكسا، دليلكم الثقافي السعودي. "
-                            "اسألوني عن تاريخ المملكة وتراثها."
-                        )
-
-                    try:
-
-                        await speak_message(
-                            websocket,
-                            greeting
-                        )
-
-                    except Exception:
-
-                        logger.exception(
-                            "Welcome speech failed"
-                        )
-
-                        await websocket.send_json({
-                            "type": "error",
-                            "message": (
-                                "تعذر تشغيل الترحيب الصوتي."
-                            )
-                        })
-
-                    continue
-
-                # ----------------------------------
-                # Visitor left
-                # ----------------------------------
-
-                if (
-                    message_type == "event"
-                    and message.get("event") == "visitor_left"
-                ):
-
-                    language = message.get(
-                        "language",
-                        "ar"
-                    )
-
-                    if language == "en":
-
-                        goodbye = (
-                            "Thank you for visiting. "
-                            "We hope you enjoyed discovering Saudi culture. "
-                            "Have a wonderful day!"
-                        )
-
-                    else:
-
-                        goodbye = (
-                            "شكراً لزيارتكم! "
-                            "سعدتُ بمشاركتكم التعرف على الثقافة السعودية. "
-                            "نتمنى لكم يوماً سعيداً."
-                        )
-
-                    try:
-
-                        await speak_message(
-                            websocket,
-                            goodbye
-                        )
-
-                    except Exception:
-
-                        logger.exception(
-                            "Goodbye speech failed"
-                        )
-
-                        await websocket.send_json({
-                            "type": "error",
-                            "message": (
-                                "تعذر تشغيل رسالة الوداع."
-                            )
-                        })
-
-                    continue
-
-                # ----------------------------------
-                # Text question
-                # ----------------------------------
-
-                if message_type == "text":
-
-                    user_message = str(
-                        message.get(
-                            "message",
-                            ""
-                        )
-                    ).strip()
-
-                    if not user_message:
-
-                        await websocket.send_json({
-                            "type": "error",
-                            "message": "اكتب سؤالك أولاً."
-                        })
-
-                        continue
-
-                    if len(user_message) > MAX_TEXT_LENGTH:
-
-                        await websocket.send_json({
-                            "type": "error",
-                            "message": "الرسالة طويلة جداً."
-                        })
-
-                        continue
-
-                    await process_question(
+                if receiving_pcm:
+                    await send_json(
                         websocket,
-                        question=user_message
+                        send_lock,
+                        {
+                            "type": "error",
+                            "message": "A recording is already in progress."
+                        }
                     )
-
                     continue
 
-                # ----------------------------------
-                # Unknown message
-                # ----------------------------------
+                if message.get("format") != "pcm_s16le":
+                    await send_json(
+                        websocket,
+                        send_lock,
+                        {
+                            "type": "error",
+                            "message": "Unsupported audio format."
+                        }
+                    )
+                    continue
 
-                await websocket.send_json({
+                if message.get("channels") != 1:
+                    await send_json(
+                        websocket,
+                        send_lock,
+                        {
+                            "type": "error",
+                            "message": "Audio must be mono."
+                        }
+                    )
+                    continue
+
+                try:
+                    pcm_rate = int(
+                        message.get("sample_rate", 16000)
+                    )
+                except (TypeError, ValueError):
+                    pcm_rate = 0
+
+                if pcm_rate not in SUPPORTED_SAMPLE_RATES:
+                    await send_json(
+                        websocket,
+                        send_lock,
+                        {
+                            "type": "error",
+                            "message": "Unsupported sample rate."
+                        }
+                    )
+                    continue
+
+                if not visitor_active.is_set():
+                    await send_json(
+                        websocket,
+                        send_lock,
+                        {
+                            "type": "error",
+                            "message": "No active visitor session."
+                        }
+                    )
+                    continue
+
+                pcm_buffer.clear()
+                receiving_pcm = True
+                continue
+
+            # AUDIO END
+            if msg_type == "audio_end":
+
+                if not receiving_pcm:
+                    await send_json(
+                        websocket,
+                        send_lock,
+                        {
+                            "type": "error",
+                            "message": "No recording is active."
+                        }
+                    )
+                    continue
+
+                receiving_pcm = False
+
+                captured = bytes(pcm_buffer)
+                pcm_buffer.clear()
+
+                if len(captured) < pcm_rate:
+                    await send_json(
+                        websocket,
+                        send_lock,
+                        {
+                            "type": "error",
+                            "message": "Recording is too short."
+                        }
+                    )
+                    continue
+
+                if len(captured) % 2:
+                    await send_json(
+                        websocket,
+                        send_lock,
+                        {
+                            "type": "error",
+                            "message": "Incomplete PCM16 sample."
+                        }
+                    )
+                    continue
+
+                if visitor_active.is_set() and worker_task and not worker_task.done():
+
+                    await visitor_queue.put(
+                        {
+                            "type": "audio",
+                            "pcm": captured,
+                            "rate": pcm_rate
+                        }
+                    )
+                continue
+
+            # TEXT QUESTION
+            if msg_type == "text":
+
+                question = str(
+                    message.get("message", "")
+                ).strip()
+
+                if not question or len(question) > MAX_TEXT_LENGTH:
+                    await send_json(
+                        websocket,
+                        send_lock,
+                        {
+                            "type": "error",
+                            "message": "Invalid text question."
+                        }
+                    )
+                    continue
+
+                if visitor_active.is_set() and worker_task and not worker_task.done():
+                    await visitor_queue.put(
+                        {
+                            "type": "text",
+                            "message": question
+                        }
+                    )
+                continue
+
+            await send_json(
+                websocket,
+                send_lock,
+                {
                     "type": "error",
-                    "message": "نوع الرسالة غير معروف."
-                })
+                    "message": "Unknown message type."
+                }
+            )
 
     except WebSocketDisconnect:
-
-        logger.info(
-            "RIWEXA disconnected"
-        )
+        logger.info("ESP32 disconnected")
 
     except Exception:
+        logger.exception("WebSocket handler failed")
 
-        logger.exception(
-            "WebSocket connection error"
-        )
+    finally:
+        visitor_active.clear()
+
+        if worker_task and not worker_task.done():
+            worker_task.cancel()
+
+            with suppress(asyncio.CancelledError):
+                await worker_task
+
+        logger.info("ESP32 WebSocket closed")
 
 
-# ==========================================
+# ============================================================
 # Startup
-# ==========================================
+# ============================================================
 
 @app.on_event("startup")
 async def startup_event():
 
-    if not client:
-
-        logger.error(
-            "GEMINI_API_KEY is missing"
-        )
-
+    if client is None:
+        logger.error("GEMINI_API_KEY is missing")
     else:
+        logger.info("Gemini client configured")
 
-        logger.info(
-            "Gemini client configured"
-        )
-
-    logger.info(
-        "RIWEXA Saudi Cultural Robot started"
-    )
+    logger.info("RIWEXA server started")
