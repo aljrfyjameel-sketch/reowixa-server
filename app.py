@@ -179,131 +179,108 @@ async def receive_live_turn(
     pending_byte = b""
     output_rate = 24000
     transcript_parts = []
+    
+    # قائمة انتظار لفصل سرعة Gemini عن سرعة إرسال ESP32
+    audio_queue = asyncio.Queue()
 
-    async for response in session.receive():
+    # عامل خلفية يقوم بإرسال الصوت بهدوء للروبوت
+    async def pacer_worker():
+        bytes_pushed = 0
+        prebuffer = 24000  # إرسال أول نصف ثانية بسرعة لملء ذاكرة الروبوت
+        
+        while visitor_active.is_set():
+            chunk = await audio_queue.get()
+            if chunk == b"END":
+                break
+                
+            await send_binary(websocket, send_lock, chunk)
+            bytes_pushed += len(chunk)
+            
+            if bytes_pushed > prebuffer:
+                duration = (len(chunk) / 2) / output_rate
+                # تنظيم التدفق دون إيقاف Gemini
+                await asyncio.sleep(duration * 0.90) 
 
-        content = response.server_content
+    pacer_task = asyncio.create_task(pacer_worker())
 
-        if content is None:
-            continue
+    try:
+        async for response in session.receive():
+            content = response.server_content
+            if content is None:
+                continue
 
-        transcription = getattr(
-            content,
-            "output_transcription",
-            None
-        )
+            transcription = getattr(content, "output_transcription", None)
+            if transcription and transcription.text:
+                transcript_parts.append(transcription.text)
 
-        if transcription and transcription.text:
-            transcript_parts.append(transcription.text)
+            model_turn = getattr(content, "model_turn", None)
+            if model_turn:
+                for part in model_turn.parts or []:
+                    inline = getattr(part, "inline_data", None)
+                    if not inline or not inline.data:
+                        continue
 
-        model_turn = getattr(content, "model_turn", None)
+                    raw_audio = inline.data
+                    if isinstance(raw_audio, str):
+                        raw_audio = base64.b64decode(raw_audio)
+                    raw_audio = bytes(raw_audio)
 
-        if model_turn:
-            for part in model_turn.parts or []:
+                    mime_type = getattr(inline, "mime_type", "") or ""
+                    output_rate = get_output_rate(mime_type)
 
-                inline = getattr(part, "inline_data", None)
+                    raw_audio = pending_byte + raw_audio
+                    usable_length = len(raw_audio) & ~1
+                    pending_byte = raw_audio[usable_length:]
+                    raw_audio = raw_audio[:usable_length]
 
-                if not inline or not inline.data:
-                    continue
-
-                raw_audio = inline.data
-
-                if isinstance(raw_audio, str):
-                    raw_audio = base64.b64decode(raw_audio)
-
-                raw_audio = bytes(raw_audio)
-
-                mime_type = getattr(inline, "mime_type", "") or ""
-
-                output_rate = get_output_rate(mime_type)
-
-                # Preserve PCM16 sample boundaries.
-                raw_audio = pending_byte + raw_audio
-                usable_length = len(raw_audio) & ~1
-
-                pending_byte = raw_audio[usable_length:]
-                raw_audio = raw_audio[:usable_length]
-
-                if not raw_audio:
-                    continue
-
-                # If the visitor has left, discard remaining
-                # response audio instead of playing it.
-                if not visitor_active.is_set():
-                    continue
-
-                if not audio_started:
-                    await send_json(
-                        websocket,
-                        send_lock,
-                        {
-                            "type": "audio_start",
-                            "format": "pcm_s16le",
-                            "sample_rate": output_rate,
-                            "channels": 1,
-                            "bits": 16
-                        }
-                    )
-
-                    audio_started = True
-
-                for offset in range(0, len(raw_audio), AUDIO_CHUNK_SIZE):
-
+                    if not raw_audio:
+                        continue
                     if not visitor_active.is_set():
-                        break
+                        continue
 
-                    chunk = raw_audio[
-                        offset:offset + AUDIO_CHUNK_SIZE
-                    ]
-
-                    if chunk:
-                        await send_binary(
+                    if not audio_started:
+                        await send_json(
                             websocket,
                             send_lock,
-                            chunk
+                            {
+                                "type": "audio_start",
+                                "format": "pcm_s16le",
+                                "sample_rate": output_rate,
+                                "channels": 1,
+                                "bits": 16
+                            }
                         )
+                        audio_started = True
 
-                        audio_bytes_sent += len(chunk)
-                        
-                        # ===================================================
-                        # FLOW CONTROL (PACING) LOGIC ADDED HERE
-                        # ===================================================
-                        # Calculate the actual playback time of this chunk in seconds.
-                        # PCM16 means 2 bytes per sample.
-                        chunk_duration = (len(chunk) / 2) / output_rate
-                        
-                        # Sleep for ~85% of the chunk's duration to pace the stream
-                        # without starving the ESP32 buffer.
-                        await asyncio.sleep(chunk_duration * 0.85)
-                        # ===================================================
+                    for offset in range(0, len(raw_audio), AUDIO_CHUNK_SIZE):
+                        if not visitor_active.is_set():
+                            break
+                        chunk = raw_audio[offset:offset + AUDIO_CHUNK_SIZE]
+                        if chunk:
+                            # نضع الصوت في القائمة بدلاً من إرساله فوراً
+                            audio_queue.put_nowait(chunk)
+                            audio_bytes_sent += len(chunk)
 
-        if getattr(content, "interrupted", False):
-            logger.info("Gemini turn interrupted")
-            break
+            if getattr(content, "interrupted", False):
+                logger.info("Gemini turn interrupted")
+                break
+            if getattr(content, "turn_complete", False):
+                break
+    finally:
+        # إغلاق مهام الخلفية بأمان
+        audio_queue.put_nowait(b"END")
+        await pacer_task
 
-        if getattr(content, "turn_complete", False):
-            break
-
-    # Always close an audio stream that was opened.
     if audio_started and not audio_ended:
-        await send_json(
-            websocket,
-            send_lock,
-            {"type": "audio_end"}
-        )
-
+        await send_json(websocket, send_lock, {"type": "audio_end"})
         audio_ended = True
 
     transcript = "".join(transcript_parts).strip()
-
     if transcript and visitor_active.is_set():
         await send_json(
             websocket,
             send_lock,
-            {
-                "type": "transcript_answer",
-                "text": transcript
-            }
+            {"type": "transcript_answer", "text": transcript}
         )
 
     logger.info(
