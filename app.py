@@ -17,7 +17,7 @@ from google.genai import types
 
 # ============================================================
 # RIWEXA - Enterprise Edition (SAIF 2026)
-# Persistent Gemini Live Session | VAD | Telemetry Dashboard
+# Persistent Gemini Live Session | VAD | Telemetry | RAG
 # ============================================================
 
 logging.basicConfig(level=logging.INFO)
@@ -37,7 +37,7 @@ AUDIO_CHUNK_SIZE = 2048
 SUPPORTED_SAMPLE_RATES = (16000, 24000)
 
 # ============================================================
-# Telemetry & Global State (NEW)
+# Telemetry & Global State
 # ============================================================
 server_start_time = time.time()
 
@@ -51,39 +51,33 @@ telemetry = {
     "last_transcript": "Waiting for input..."
 }
 
-SYSTEM_PROMPT = """
-You are RIWEXA, a Saudi cultural guide robot.
+# ============================================================
+# Enterprise Knowledge Base (RAG & Grounding)
+# ============================================================
+CULTURAL_KNOWLEDGE_BASE = """
+[معالم المملكة وتاريخها - مرجع أساسي موثوق لـ RIWEXA]
+1. الدرعية التاريخية (منطقة الرياض): عاصمة الدولة السعودية الأولى، ومسجلّة في قائمة التراث العالمي لليونسكو، وتضم حي الطريف الأثري.
+2. العلا (منطقة المدينة المنورة): تضم موقع الحجر الأثري (مدائن صالح)، وهو أول موقع مسجل في المملكة ضمن قائمة التراث العالمي لليونسكو، ويتميز بآثار نبطية منحوتة في الصخور.
+3. منطقة عسير (أبها وخميس مشيط): تتميز بالتراث العمراني الفريد مثل قصر شدا، وفن العسير (القط العسيري) المسجل في اليونسكو، وطبيعتها الجبلية الخلابة.
+4. جدة التاريخية (البلد): تتميز بيوتها التاريخية الرواشين الخشبية القديمة، وتعتبر بوابة الحجاج التاريخية على البحر الأحمر.
+5. قصر المصمك (الرياض): حصن طيني تاريخي شهد انطلاق ملحمة توحيد المملكة العربية السعودية على يد الملك عبد العزيز آل سعود عام 1902م (1319هـ).
+6. رؤية السعودية 2030: خطة استراتيجية وطنية أطلقها ولي العهد الأمير محمد بن سلمان لتنويع الاقتصاد السعودي وتنمية المجالات المختلفة.
+"""
 
-You help visitors discover:
-- Saudi history and heritage.
-- Saudi regions and traditions.
-- Museums, historical sites and landmarks.
-- Traditional arts, crafts, clothing and food.
-- Saudi culture and national identity.
+GROUNDED_SYSTEM_PROMPT = f"""
+You are RIWEXA, a Saudi cultural guide robot participating in SAIF 2026.
 
-LANGUAGE:
-- Automatically identify the language spoken by the visitor.
-- If the visitor speaks Arabic, answer in natural Arabic.
-- If the visitor speaks English, answer in natural English.
-- If the visitor changes language, immediately follow the latest language.
-- Never ask the visitor to choose a language.
-- Keep the conversation context across all questions in this visit.
+STRICT GROUNDING RULES:
+- You must answer questions about Saudi history, landmarks, and culture strictly based on the Knowledge Base provided below.
+- Do not invent historical facts, dates, or locations. If a fact is not in the knowledge base, state honestly that you don't have its specific details.
+- Be welcoming, clear, and professional. Speak naturally and clearly in Arabic or English based on the visitor.
 
-BEHAVIOR:
-- Be welcoming, clear, friendly and informative.
-- Do not invent historical facts, dates or sources.
-- If you do not know something, say so honestly.
-- Do not claim to see the visitor or surroundings.
-- Keep spoken answers appropriate for a public exhibition.
-
-AUDIO:
-- Always answer using native audio.
-- Do not replace spoken answers with text.
-- Speak naturally and clearly.
+KNOWLEDGE BASE:
+{CULTURAL_KNOWLEDGE_BASE}
 """
 
 # ============================================================
-# HTTP & Dashboard Endpoints (NEW)
+# HTTP & Dashboard Endpoints
 # ============================================================
 
 @app.get("/")
@@ -91,7 +85,7 @@ async def home():
     return {
         "status": "ok",
         "service": "RIWEXA Enterprise",
-        "mode": "telemetry-enabled"
+        "mode": "telemetry-grounded-rag"
     }
 
 @app.head("/")
@@ -197,7 +191,6 @@ async def dashboard():
                     console.error('Failed to fetch telemetry', error);
                 }
             }
-            // Auto-refresh every 2 seconds
             setInterval(fetchTelemetry, 2000);
             fetchTelemetry();
         </script>
@@ -239,7 +232,7 @@ async def send_binary(ws, lock, payload):
         await ws.send_bytes(payload)
 
 # ============================================================
-# Gemini Live response receiver
+# Gemini Live response receiver with Pacing & Queue
 # ============================================================
 
 async def receive_live_turn(
@@ -268,8 +261,6 @@ async def receive_live_turn(
                 
             await send_binary(websocket, send_lock, chunk)
             bytes_pushed += len(chunk)
-            
-            # Telemetry Update
             telemetry["audio_bytes_streamed"] += len(chunk)
             
             if bytes_pushed > prebuffer:
@@ -308,9 +299,7 @@ async def receive_live_turn(
                     pending_byte = raw_audio[usable_length:]
                     raw_audio = raw_audio[:usable_length]
 
-                    if not raw_audio:
-                        continue
-                    if not visitor_active.is_set():
+                    if not raw_audio or not visitor_active.is_set():
                         continue
 
                     if not audio_started:
@@ -362,29 +351,15 @@ async def receive_live_turn(
 # Gemini turn sender
 # ============================================================
 
-async def run_text_turn(
-    session,
-    websocket,
-    send_lock,
-    visitor_active,
-    prompt
-):
+async def run_text_turn(session, websocket, send_lock, visitor_active, prompt):
     await session.send_realtime_input(text=prompt)
     return await receive_live_turn(session, websocket, send_lock, visitor_active)
 
-async def run_audio_turn(
-    session,
-    websocket,
-    send_lock,
-    visitor_active,
-    pcm,
-    sample_rate
-):
+async def run_audio_turn(session, websocket, send_lock, visitor_active, pcm, sample_rate):
     if not pcm or len(pcm) % 2:
         raise ValueError("Invalid PCM audio")
 
     await session.send_realtime_input(activity_start=types.ActivityStart())
-
     chunk_size = 4096
     mime_type = f"audio/pcm;rate={sample_rate}"
 
@@ -392,12 +367,9 @@ async def run_audio_turn(
         if not visitor_active.is_set():
             break
         chunk = pcm[offset:offset + chunk_size]
-        await session.send_realtime_input(
-            audio=types.Blob(data=chunk, mime_type=mime_type)
-        )
+        await session.send_realtime_input(audio=types.Blob(data=chunk, mime_type=mime_type))
 
     await session.send_realtime_input(activity_end=types.ActivityEnd())
-
     if not visitor_active.is_set():
         return 0
 
@@ -407,19 +379,14 @@ async def run_audio_turn(
 # Persistent visitor session worker
 # ============================================================
 
-async def visitor_worker(
-    websocket,
-    send_lock,
-    queue,
-    visitor_active
-):
+async def visitor_worker(websocket, send_lock, queue, visitor_active):
     if client is None:
         await send_json(websocket, send_lock, {"type": "error", "message": "GEMINI_API_KEY is missing."})
         return
 
     config = types.LiveConnectConfig(
         response_modalities=["AUDIO"],
-        system_instruction=SYSTEM_PROMPT,
+        system_instruction=GROUNDED_SYSTEM_PROMPT,
         speech_config=types.SpeechConfig(
             voice_config=types.VoiceConfig(
                 prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=TTS_VOICE)
@@ -443,16 +410,16 @@ async def visitor_worker(
                 try:
                     if job_type == "welcome":
                         visitor_active.set()
-                        telemetry["last_transcript"] = "[System] Visitor Arrival Greet..."
+                        telemetry["last_transcript"] = "[System] Greet visitor..."
                         await run_text_turn(
                             session, websocket, send_lock, visitor_active,
-                            "A visitor has arrived. Welcome them warmly in Arabic. Introduce yourself briefly as RIWEXA, their Saudi cultural guide. Follow the visitor's spoken language in all later replies."
+                            "A visitor has arrived. Welcome them warmly in Arabic using the Grounding rules. Introduce yourself briefly as RIWEXA, their Saudi cultural guide."
                         )
 
                     elif job_type == "audio":
                         if visitor_active.is_set():
                             telemetry["total_questions"] += 1
-                            telemetry["last_transcript"] = "[System] Processing Audio Question..."
+                            telemetry["last_transcript"] = "[System] Processing audio question..."
                             await run_audio_turn(
                                 session, websocket, send_lock, visitor_active,
                                 job["pcm"], job["rate"]
@@ -469,10 +436,10 @@ async def visitor_worker(
 
                     elif job_type == "goodbye":
                         visitor_active.set()
-                        telemetry["last_transcript"] = "[System] Sending Goodbye..."
+                        telemetry["last_transcript"] = "[System] Saying goodbye..."
                         await run_text_turn(
                             session, websocket, send_lock, visitor_active,
-                            "The visitor is leaving now. Give them a brief, warm goodbye. Use the language they most recently spoke."
+                            "The visitor is leaving now. Give them a brief, warm goodbye."
                         )
                         await send_json(websocket, send_lock, {"type": "session", "status": "ended"})
                         break
@@ -506,7 +473,6 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     logger.info("ESP32 connected")
     
-    # Update Telemetry Global Status
     telemetry["status"] = "ONLINE"
     telemetry["last_transcript"] = "Robot connected. Waiting for visitor..."
 
@@ -532,7 +498,6 @@ async def websocket_endpoint(websocket: WebSocket):
 
         while True:
             packet = await websocket.receive()
-
             if packet.get("type") == "websocket.disconnect":
                 break
 
@@ -566,7 +531,6 @@ async def websocket_endpoint(websocket: WebSocket):
                 if worker_task and not worker_task.done():
                     continue
                 
-                # Telemetry Update
                 telemetry["total_visitors"] += 1
                 telemetry["last_visitor_time"] = datetime.now().strftime("%H:%M:%S")
                 
