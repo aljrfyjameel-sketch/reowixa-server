@@ -1,4 +1,3 @@
-
 import os
 import io
 import re
@@ -265,6 +264,18 @@ async def receive_live_turn(
                         )
 
                         audio_bytes_sent += len(chunk)
+                        
+                        # ===================================================
+                        # FLOW CONTROL (PACING) LOGIC ADDED HERE
+                        # ===================================================
+                        # Calculate the actual playback time of this chunk in seconds.
+                        # PCM16 means 2 bytes per sample.
+                        chunk_duration = (len(chunk) / 2) / output_rate
+                        
+                        # Sleep for ~85% of the chunk's duration to pace the stream
+                        # without starving the ESP32 buffer.
+                        await asyncio.sleep(chunk_duration * 0.85)
+                        # ===================================================
 
         if getattr(content, "interrupted", False):
             logger.info("Gemini turn interrupted")
@@ -525,8 +536,8 @@ async def visitor_worker(
                             }
                         )
 
-                    if job_type == "goodbye":
-                        break
+                if job_type == "goodbye":
+                    break
 
     except asyncio.CancelledError:
         raise
