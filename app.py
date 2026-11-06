@@ -234,12 +234,8 @@ async def send_audio_stream(
     pcm: bytes,
     sample_rate: int
 ):
-    """Send mono PCM16 audio to the ESP32 at its playback rate."""
     if not pcm or len(pcm) % 2:
         raise ValueError("Invalid PCM audio")
-
-    if sample_rate not in (16000, 24000):
-        raise ValueError(f"Unsupported sample rate: {sample_rate}")
 
     await websocket.send_json({
         "type": "audio_start",
@@ -249,22 +245,17 @@ async def send_audio_stream(
         "bits": 16
     })
 
-    # 20 ms frames: 640 bytes at 16 kHz, 960 bytes at 24 kHz.
-    frame_bytes = sample_rate * 2 // 50
-    loop = asyncio.get_running_loop()
-    next_send = loop.time()
+    # Keep frames small for ESP32
+    chunk_size = 2048
 
-    for offset in range(0, len(pcm), frame_bytes):
-        frame = pcm[offset:offset + frame_bytes]
-        await websocket.send_bytes(frame)
+    for offset in range(0, len(pcm), chunk_size):
+        await websocket.send_bytes(
+            pcm[offset:offset + chunk_size]
+        )
 
-        # Pace by the actual duration of this frame.
-        next_send += len(frame) / (sample_rate * 2)
-        delay = next_send - loop.time()
-        if delay > 0:
-            await asyncio.sleep(delay)
-
-    await websocket.send_json({"type": "audio_end"})
+    await websocket.send_json({
+        "type": "audio_end"
+    })
 
 
 # ==========================================
@@ -293,29 +284,23 @@ async def speak_message(
 # Low-latency audio-to-audio response
 # ==========================================
 
-async def answer_with_live(
-    websocket: WebSocket,
-    wav_bytes: bytes = None,
-    question: str = None
-) -> bool:
-    """Generate with Gemini Live and stream PCM audio to the ESP32 as it arrives.
+async def answer_with_live(websocket: WebSocket, wav_bytes: bytes = None, question: str = None) -> bool:
+    """Stream a recorded visitor question through Gemini Live and relay its audio.
 
-    Returns False only if Live fails before any audio has been sent, allowing
-    the caller to use the existing transcription + TTS fallback.
+    Returns False only when Live fails before sending any audio, so the caller can
+    fall back to the existing transcription + TTS path.
     """
     if not client:
         return False
 
     pcm = b""
     sample_rate = 16000
-
     if wav_bytes is not None:
         with wave.open(io.BytesIO(wav_bytes), "rb") as wav:
             if wav.getnchannels() != 1 or wav.getsampwidth() != 2:
                 raise ValueError("Live input must be mono PCM16 WAV")
             sample_rate = wav.getframerate()
             pcm = wav.readframes(wav.getnframes())
-
         if sample_rate not in (16000, 24000) or not pcm:
             raise ValueError("Unsupported or empty Live audio input")
     elif not question:
@@ -323,96 +308,49 @@ async def answer_with_live(
 
     system_instruction = (
         SYSTEM_PROMPT
-        + "\\n\\nأجب بلغة الزائر مباشرة وبإجابة صوتية قصيرة لا تتجاوز جملتين."
+        + "\n\nأجب بلغة الزائر مباشرة وبإجابة صوتية قصيرة لا تتجاوز جملتين."
     )
-
     config_fields = {
         "response_modalities": ["AUDIO"],
         "system_instruction": system_instruction,
         "speech_config": types.SpeechConfig(
             voice_config=types.VoiceConfig(
-                prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                    voice_name=TTS_VOICE
-                )
+                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=TTS_VOICE)
             )
         ),
         "output_audio_transcription": types.AudioTranscriptionConfig(),
     }
-
     if pcm:
+        # The robot sends a completed clip; close its turn explicitly instead of
+        # relying on server VAD to infer silence from a fast upload.
         config_fields["realtime_input_config"] = types.RealtimeInputConfig(
-            automatic_activity_detection=types.AutomaticActivityDetection(
-                disabled=True
-            )
+            automatic_activity_detection=types.AutomaticActivityDetection(disabled=True)
         )
-
     config = types.LiveConnectConfig(**config_fields)
 
     audio_started = False
+    audio_output = bytearray()
     transcript_parts = []
-    pending_pcm = bytearray()
-    output_rate = 24000  # Gemini Live audio output rate used by this project.
-
-    # Send small PCM16 frames while Live is still generating the answer.
-    frame_bytes = output_rate * 2 // 50  # 20 ms at 24 kHz.
-    loop = asyncio.get_running_loop()
-    next_send = loop.time()
-
-    async def send_live_frame(frame: bytes):
-        nonlocal audio_started, next_send
-
-        if not frame:
-            return
-
-        if not audio_started:
-            await websocket.send_json({
-                "type": "audio_start",
-                "format": "pcm_s16le",
-                "sample_rate": output_rate,
-                "channels": 1,
-                "bits": 16
-            })
-            audio_started = True
-            next_send = loop.time()
-
-        await websocket.send_bytes(frame)
-
-        next_send += len(frame) / (output_rate * 2)
-        delay = next_send - loop.time()
-        if delay > 0:
-            await asyncio.sleep(delay)
-
     try:
-        async with client.aio.live.connect(
-            model=LIVE_MODEL,
-            config=config
-        ) as session:
+        async with client.aio.live.connect(model=LIVE_MODEL, config=config) as session:
             if pcm:
                 chunk_size = 4096
                 mime_type = f"audio/pcm;rate={sample_rate}"
-
-                await session.send_realtime_input(
-                    activity_start=types.ActivityStart()
-                )
-
+                await session.send_realtime_input(activity_start=types.ActivityStart())
                 for offset in range(0, len(pcm), chunk_size):
                     await session.send_realtime_input(
                         audio=types.Blob(
                             data=pcm[offset:offset + chunk_size],
-                            mime_type=mime_type
+                            mime_type=mime_type,
                         )
                     )
-
-                await session.send_realtime_input(
-                    activity_end=types.ActivityEnd()
-                )
+                await session.send_realtime_input(activity_end=types.ActivityEnd())
             else:
                 await session.send_client_content(
                     turns=types.Content(
-                        role="user",
-                        parts=[types.Part.from_text(text=question)]
+                        role="user", parts=[types.Part.from_text(text=question)]
                     ),
-                    turn_complete=True
+                    turn_complete=True,
                 )
 
             async for response in session.receive():
@@ -434,76 +372,57 @@ async def answer_with_live(
                         audio = inline.data
                         if isinstance(audio, str):
                             audio = audio.encode("latin-1")
-
-                        # PCM16 must always contain complete 16-bit samples.
-                        if len(audio) % 2:
-                            audio = audio[:-1]
-
+                        audio = audio[:len(audio) & ~1]
                         if not audio:
                             continue
 
-                        pending_pcm.extend(audio)
-
-                        # Emit complete 20 ms frames immediately; do not wait
-                        # for the full Gemini response to finish.
-                        while len(pending_pcm) >= frame_bytes:
-                            frame = bytes(pending_pcm[:frame_bytes])
-                            del pending_pcm[:frame_bytes]
-                            await send_live_frame(frame)
+                        audio_output.extend(audio)
+                        if len(audio_output) > 1_000_000:
+                            raise ValueError("Gemini Live answer exceeded audio buffer limit")
 
                 if content.turn_complete:
                     break
 
-        # Flush the final partial frame, then close the audio stream once.
-        if pending_pcm:
-            await send_live_frame(bytes(pending_pcm))
-            pending_pcm.clear()
-
-        if audio_started:
-            await websocket.send_json({"type": "audio_end"})
+        if not audio_output:
+            return False
 
         answer = "".join(transcript_parts).strip()
         if answer:
-            await websocket.send_json({
-                "type": "response",
-                "message": answer
-            })
-            await websocket.send_json({
-                "type": "transcript_answer",
-                "text": answer
-            })
+            await websocket.send_json({"type": "response", "message": answer})
+            await websocket.send_json({"type": "transcript_answer", "text": answer})
 
-        return audio_started
+        # Wait for the complete Live answer, then deliver it in a steady stream.
+        await websocket.send_json({
+            "type": "audio_start",
+            "format": "pcm_s16le",
+            "sample_rate": 24000,
+            "channels": 1,
+            "bits": 16,
+        })
+        audio_started = True
+        for offset in range(0, len(audio_output), 2048):
+            await websocket.send_bytes(audio_output[offset:offset + 2048])
+        await websocket.send_json({"type": "audio_end"})
+        return True
 
     except Exception as exc:
-        provider_status = (
-            getattr(exc, "status_code", None)
-            or getattr(exc, "code", None)
-        )
-        logger.exception(
-            "Gemini Live audio response failed (%s, %s)",
-            type(exc).__name__,
-            provider_status
-        )
-
+        provider_status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+        logger.exception("Gemini Live audio response failed (%s, %s)", type(exc).__name__, provider_status)
         try:
             await websocket.send_json({
                 "type": "diagnostic",
                 "source": "live",
                 "error_type": type(exc).__name__,
-                "status": provider_status
+                "status": provider_status,
             })
         except Exception:
             pass
-
         if audio_started:
-            # Once audio has begun, do not switch to TTS mid-response.
             try:
                 await websocket.send_json({"type": "audio_end"})
             except Exception:
                 pass
             raise
-
         return False
 
 
