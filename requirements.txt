@@ -1,8 +1,4 @@
-flask
-transformers
-torch
-numpy
-pydub
-gtts
-google-generativeai
-psutil
+fastapi
+uvicorn[standard]
+google-genai
+websockets
