@@ -1,16 +1,17 @@
-from flask import Flask, request, jsonify, send_file
-import os, logging, io, re, gc, threading, time, uuid, tempfile
-import numpy as np
-from 【entity-transformers¦canonical_name=transformers】 import pipeline
-import google.generativeai as genai
-from gtts import gTTS
-from pydub import AudioSegment
-import psutil
+# RIWEXA - Gemini Live 3.8 - Full Production Server
+# ESP32-S3 <-> WebSocket /ws <-> Gemini Live 3.8 <-> Audio PCM16
+# SAIF 2026 - Live bidirectional, no REST, no gTTS, no Whisper
+# الصوت Native من جمناي نفسه
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+import os, json, logging, asyncio, base64
+from google import genai
+from google.genai import types
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("RIWEXA-LIVE")
 
-# ===== برومبتك المعتمد كامل - لا يتغير =====
+# ================= RIWEXA SYSTEM PROMPT - المعتمد =================
 RIWEXA_SYSTEM_PROMPT = """
 You are RIWEXA, a Saudi cultural guide robot.
 
@@ -42,89 +43,184 @@ AUDIO:
 - Speak naturally and clearly.
 """
 
-# ===== اعداد جمناي =====
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-gemini_model = genai.GenerativeModel("gemini-1.5-flash", system_instruction=RIWEXA_SYSTEM_PROMPT)
+app = FastAPI(title="RIWEXA Live")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-app = Flask(__name__)
-app.config['TEMP_AUDIO_DIR'] = '/tmp/audio_responses'
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
+# ================= CONFIG - Gemini Live 3.8 =================
+MODEL_ID = "gemini-3.8-live"  # <-- Live 3.8 - الحديث، مو 1.5 ولا 2.5 العادي
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
-stt_pipeline = None
-conversation_history = {} # session_id -> chat session
+LIVE_CONFIG = types.LiveConnectConfig(
+    response_modalities=["AUDIO"],
+    system_instruction=types.Content(
+        parts=[types.Part.from_text(text=RIWEXA_SYSTEM_PROMPT)]
+    ),
+    speech_config=types.SpeechConfig(
+        voice_config=types.VoiceConfig(
+            prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Puck")
+        )
+    ),
+    # يكتشف متى الزائر خلص كلامه تلقائيا
+    realtime_input_config=types.RealtimeInputConfig(
+        automatic_activity_detection=types.AutomaticActivityDetection(
+            disabled=False,
+            start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_HIGH,
+            end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_HIGH,
+            prefix_padding_ms=20,
+            silence_duration_ms=500,
+        )
+    ),
+    # يحفظ سياق المحادثة داخل الجلسة نفسها
+    session_resumption=types.SessionResumptionConfig(handle=None),
+)
 
-def detect_lang(text):
-    return 'ar' if re.search(r'[\u0600-\u06FF]', text) else 'en'
+@app.get("/")
+def root():
+    return {"service": "RIWEXA", "status": "online", "model": MODEL_ID, "mode": "gemini-live", "ws": "/ws"}
 
-def init_stt():
-    global stt_pipeline
-    if stt_pipeline is None:
-        device = "cuda" if __import__('torch').cuda.is_available() else "cpu"
-        stt_pipeline = pipeline("automatic-speech-recognition", model="openai/【entity-whisper¦canonical_name=Whisper】-tiny", device=device)
-        logger.info("【entity-Whisper¦canonical_name=Whisper】 loaded")
-
-def get_chat(session_id):
-    if session_id not in conversation_history:
-        conversation_history[session_id] = gemini_model.start_chat(history=[])
-    return conversation_history[session_id]
-
-def ask_gemini(text, session_id):
-    chat = get_chat(session_id)
-    resp = chat.send_message(text)
-    return resp.text.strip()
-
-def make_tts(text):
-    lang = detect_lang(text)
-    tts = gTTS(text=text, lang=lang, slow=False)
-    with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as tmp:
-        tts.save(tmp.name)
-        seg = AudioSegment.from_file(tmp.name, format="mp3")
-        seg = seg.set_frame_rate(16000).set_channels(1)
-        buf = io.BytesIO()
-        seg.export(buf, format="wav")
-        os.unlink(tmp.name)
-        return buf.getvalue()
-
-@app.route('/process_audio', methods=['POST'])
-def process_audio():
-    init_stt()
-    session_id = request.headers.get('X-Session-ID', 'default')
-    if not request.data:
-        return jsonify({"error": "No audio"}), 400
-    # فك WAV
-    data = request.data
-    if data[:4] == b'RIFF':
-        data = data[44:]
-    audio = np.frombuffer(data, dtype=np.int16).astype(np.float32)/32768.0
-    stt = stt_pipeline({"sampling_rate": 16000, "raw": audio})
-    user_text = stt.get('text','').strip()
-    if not user_text:
-        user_text = "هلا"
-    # جمناي يرد بالبرومبت المعتمد
-    answer = ask_gemini(user_text, session_id)
-    wav = make_tts(answer)
-    if not os.path.exists(app.config['TEMP_AUDIO_DIR']):
-        os.makedirs(app.config['TEMP_AUDIO_DIR'])
-    fid = str(uuid.uuid4())
-    path = os.path.join(app.config['TEMP_AUDIO_DIR'], f"{fid}.wav")
-    open(path,'wb').write(wav)
-    return jsonify({"status":"success","file_id":fid,"stream_url":f"/stream_audio/{fid}","message":answer,"transcribed":user_text,"lang":detect_lang(answer)})
-
-@app.route('/stream_audio/<fid>')
-def stream(fid):
-    path = os.path.join(app.config['TEMP_AUDIO_DIR'], f"{fid}.wav")
-    if os.path.exists(path):
-        return send_file(path, mimetype='audio/wav')
-    return jsonify({"error":"not found"}),404
-
-@app.route('/health')
+@app.get("/health")
 def health():
-    return jsonify({"status":"healthy","service":"RIWEXA","model":"gemini-1.5-flash","stt":"whisper-tiny","tts":"gtts"})
+    return {
+        "status": "healthy",
+        "service": "RIWEXA",
+        "model": MODEL_ID,
+        "mode": "gemini-live-3.8",
+        "gemini_configured": client is not None,
+        "endpoints": ["/ws", "/health"]
+    }
 
-@app.route('/')
-def home():
-    return jsonify({"service":"RIWEXA with Gemini","status":"online"})
+@app.get("/api/text")
+def api_text(text: str = "هلا"):
+    # للتجربة السريعة من المتصفح بدون ESP32 - يرد نص فقط
+    return {"answer": f"Live mode: افتح /ws للصوت. سؤالك كان: {text}", "model": MODEL_ID, "note": "Use WebSocket /ws for audio"}
 
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 7860))
-    app.run(host='0.0.0.0', port=port)
+# ================= WEBSOCKET /ws - القلب =================
+# بروتوكول ESP32:
+# ESP32 -> Server: {"type":"audio_start"} / {"type":"audio","data":"base64 PCM16 16kHz"} / {"type":"audio_end"}
+# ESP32 -> Server: {"type":"visitor_detected"} / {"type":"visitor_left"} / {"type":"session_end"}
+# Server -> ESP32: {"type":"audio","data":"base64 PCM16 24kHz"} / {"type":"status","msg":"..."} / {"type":"transcript","text":"..."}
+@app.websocket("/ws")
+async def ws_endpoint(ws: WebSocket):
+    await ws.accept()
+    logger.info("ESP32 connected to /ws")
+    if client is None:
+        await ws.send_json({"type": "error", "msg": "GEMINI_API_KEY missing in Render"})
+        await ws.close()
+        return
+
+    session_id = f"live-{id(ws)}"
+    try:
+        async with client.aio.live.connect(model=MODEL_ID, config=LIVE_CONFIG) as session:
+            logger.info(f"Gemini Live {MODEL_ID} session started {session_id}")
+
+            # ارسل ترحيب تلقائي اول ما يتصل الزائر
+            await ws.send_json({"type": "status", "msg": "live_connected", "model": MODEL_ID})
+
+            async def esp32_to_gemini():
+                """يستقبل صوت ESP32 ويحوله لجمناي"""
+                try:
+                    while True:
+                        msg = await ws.receive()
+                        if msg.get("text"):
+                            try:
+                                data = json.loads(msg["text"])
+                            except:
+                                continue
+                            mtype = data.get("type")
+                            if mtype == "audio":
+                                # ESP32 يرسل PCM16 16kHz base64
+                                pcm = base64.b64decode(data["data"])
+                                await session.send_realtime_input(
+                                    audio=types.Blob(data=pcm, mime_type="audio/pcm;rate=16000")
+                                )
+                            elif mtype == "audio_start":
+                                logger.info("Visitor started speaking")
+                            elif mtype == "audio_end":
+                                logger.info("Visitor finished speaking")
+                            elif mtype == "visitor_detected":
+                                # الزائر وصل - خلي جمناي يرحب
+                                await session.send_client_content(
+                                    turns=types.Content(role="user", parts=[types.Part.from_text(text="[Visitor just arrived. Greet them warmly in the language they will use, keep it short.]")]),
+                                    turn_complete=True
+                                )
+                            elif mtype == "visitor_left" or mtype == "session_end":
+                                logger.info("Visitor left - ending session")
+                                await session.send_client_content(
+                                    turns=types.Content(role="user", parts=[types.Part.from_text(text="[Visitor is leaving. Say a short warm goodbye.]")]),
+                                    turn_complete=True
+                                )
+                                # ننتظر ثانيتين للوداع ثم نغلق
+                                await asyncio.sleep(2)
+                                break
+                            elif mtype == "text":
+                                # للتجربة من المتصفح
+                                await session.send_client_content(
+                                    turns=types.Content(role="user", parts=[types.Part.from_text(text=data.get("text", ""))]),
+                                    turn_complete=True
+                                )
+                        elif msg.get("bytes"):
+                            # لو ESP32 ارسل صوت خام بدون JSON
+                            await session.send_realtime_input(
+                                audio=types.Blob(data=msg["bytes"], mime_type="audio/pcm;rate=16000")
+                            )
+                except WebSocketDisconnect:
+                    logger.info("ESP32 disconnected")
+                except Exception as e:
+                    logger.error(f"esp32_to_gemini: {e}")
+
+            async def gemini_to_esp32():
+                """يستقبل صوت جمناي ويرسله لـ ESP32"""
+                try:
+                    async for response in session.receive():
+                        if response.server_content:
+                            sc = response.server_content
+                            # نص للـ LCD
+                            if sc.output_transcription:
+                                txt = sc.output_transcription.text
+                                if txt:
+                                    await ws.send_json({"type": "transcript", "text": txt, "role": "riwexa"})
+                            if sc.input_transcription:
+                                txt = sc.input_transcription.text
+                                if txt:
+                                    await ws.send_json({"type": "transcript", "text": txt, "role": "visitor"})
+                            # صوت PCM16 24kHz - يروح للسماعة مباشرة
+                            if sc.model_turn:
+                                for part in sc.model_turn.parts:
+                                    if part.inline_data and part.inline_data.data:
+                                        b64 = base64.b64encode(part.inline_data.data).decode()
+                                        await ws.send_json({"type": "audio", "data": b64, "rate": 24000})
+                            if sc.turn_complete:
+                                await ws.send_json({"type": "turn_complete"})
+                            if sc.interrupted:
+                                await ws.send_json({"type": "interrupted"})
+                        elif response.session_resumption_update:
+                            logger.info(f"Session resumed: {response.session_resumption_update}")
+                        elif response.go_away:
+                            logger.info("Gemini asked to go away")
+                            break
+                except Exception as e:
+                    logger.error(f"gemini_to_esp32: {e}")
+
+            # شغل الاتجاهين مع بعض - صوت رايح جاي بنفس الوقت
+            await asyncio.gather(esp32_to_gemini(), gemini_to_esp32())
+
+    except WebSocketDisconnect:
+        logger.info("WS disconnected")
+    except Exception as e:
+        logger.error(f"Live session error: {e}", exc_info=True)
+        try:
+            await ws.send_json({"type": "error", "msg": str(e), "model": MODEL_ID})
+        except:
+            pass
+    finally:
+        try:
+            await ws.close()
+        except:
+            pass
+        logger.info(f"Live session closed {session_id}")
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
